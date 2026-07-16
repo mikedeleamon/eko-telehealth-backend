@@ -2,10 +2,24 @@ import { Router } from 'express';
 import { eq } from 'drizzle-orm';
 import { configured, env } from '../config/env';
 import { getDb } from '../db/client';
-import { appointments, conversations, messages, payments } from '../db/schema';
+import { appointments, conversations, doctors, messages, payments } from '../db/schema';
 import { asyncHandler } from '../lib/http';
+import { notify } from '../services/notify';
 import { capturePaypalOrder, verifyPaypalWebhook } from '../services/payments/paypal';
 import { verifyStreamWebhook } from '../services/stream';
+
+/** Payment settled: notify the patient who booked the appointment. */
+async function notifyPaymentSucceeded(appointmentId: string): Promise<void> {
+  const db = getDb();
+  const [appt] = await db.select().from(appointments).where(eq(appointments.id, appointmentId));
+  if (appt) {
+    await notify(
+      appt.patientId,
+      'Payment Successful',
+      `Your payment of ${appt.fee} for the visit with ${appt.doctorName} has been processed.`,
+    );
+  }
+}
 
 const router = Router();
 
@@ -50,6 +64,7 @@ router.post(
         .returning();
       if (paid && payment?.appointmentId) {
         await db.update(appointments).set({ status: 'upcoming' }).where(eq(appointments.id, payment.appointmentId));
+        await notifyPaymentSucceeded(payment.appointmentId);
       }
     }
     res.json({ received: true });
@@ -128,6 +143,7 @@ router.post(
         .returning();
       if (captureOutcome === 'succeeded' && payment?.appointmentId) {
         await db.update(appointments).set({ status: 'upcoming' }).where(eq(appointments.id, payment.appointmentId));
+        await notifyPaymentSucceeded(payment.appointmentId);
       }
     }
 
@@ -184,6 +200,15 @@ router.post(
               unread: senderId === conversation.patientId ? conversation.unread : conversation.unread + 1,
             })
             .where(eq(conversations.id, channelId));
+
+          // Tell the other party. The doctor side only has a user to notify
+          // when the doctor profile is linked to an account.
+          if (senderId === conversation.patientId) {
+            const [doc] = await db.select().from(doctors).where(eq(doctors.id, conversation.doctorId));
+            if (doc?.userId) await notify(doc.userId, 'New Message', message.text ?? 'You have a new message.');
+          } else {
+            await notify(conversation.patientId, 'New Message', message.text ?? 'You have a new message.');
+          }
         }
       } catch (err) {
         // Log but still ack, so Stream doesn't retry a poison message forever.

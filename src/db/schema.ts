@@ -13,6 +13,11 @@ export const users = pgTable('users', {
   firstName: text('first_name').notNull(),
   lastName: text('last_name').notNull(),
   email: text('email').notNull().unique(),
+  // Normalized MSISDN (e.g. 2348012345678) — see normalizeMsisdn in
+  // services/sms.ts. Stored normalized so SMS password reset resolves the
+  // account however the number was typed. Nullable: seeded and admin accounts
+  // predate phone capture and reset by email instead.
+  phone: text('phone').unique(),
   passwordHash: text('password_hash').notNull(),
   role: text('role').$type<'Patient' | 'Doctor' | 'Admin'>().notNull().default('Patient'),
   status: text('status').$type<'active' | 'suspended'>().notNull().default('active'),
@@ -149,15 +154,21 @@ export const reviews = pgTable('reviews', {
   text: text('text').notNull(),
   submittedAt: text('submitted_at').notNull(),
   status: text('status').$type<'pending' | 'published' | 'removed'>().notNull().default('pending'),
+  // submittedAt is a display string; this is the real sort key.
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
 /** Short-lived OTP / reset codes for /auth/{verify,forgot-password,send-code}. */
 export const verificationCodes = pgTable('verification_codes', {
   id: uuid('id').defaultRandom().primaryKey(),
-  // Email address or phone number the code was sent to, depending on channel.
+  // Email address or normalized phone the code was sent to, per channel.
   destination: text('destination').notNull(),
   channel: text('channel').$type<'email' | 'sms'>().notNull(),
   code: text('code').notNull(),
+  // Failed guesses against this destination. A 6-digit code is only a million
+  // possibilities, so without a cap it is brute-forceable inside the 15-minute
+  // window; codes are burned once this hits MAX_CODE_ATTEMPTS.
+  attempts: integer('attempts').notNull().default(0),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });

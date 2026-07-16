@@ -6,6 +6,7 @@ import { appointments, doctors, type AppointmentRow } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { requireAuth } from '../middleware/auth';
+import { notify } from '../services/notify';
 
 const router = Router();
 router.use(requireAuth);
@@ -72,6 +73,20 @@ router.post(
         status: 'upcoming',
       })
       .returning();
+
+    await notify(
+      req.user!.id,
+      'Appointment Booked',
+      `Your ${input.type.toLowerCase()} with ${doctor.name} on ${input.date} at ${input.time} is booked.`,
+    );
+    if (doctor.userId) {
+      await notify(
+        doctor.userId,
+        'New Appointment',
+        `A patient booked a ${input.type.toLowerCase()} on ${input.date} at ${input.time}.`,
+      );
+    }
+
     res.status(201).json(toAppointment(row!));
   }),
 );
@@ -87,6 +102,23 @@ router.post(
       .where(and(eq(appointments.id, param(req, 'id')), eq(appointments.patientId, req.user!.id)))
       .returning();
     if (!row) throw new HttpError(404, 'Appointment not found');
+
+    await notify(
+      req.user!.id,
+      'Appointment Cancelled',
+      `Your appointment with ${row.doctorName} on ${row.date} was cancelled.`,
+    );
+    if (row.doctorId) {
+      const [doctor] = await db.select().from(doctors).where(eq(doctors.id, row.doctorId));
+      if (doctor?.userId) {
+        await notify(
+          doctor.userId,
+          'Appointment Cancelled',
+          `The ${row.date} ${row.time} appointment was cancelled by the patient.`,
+        );
+      }
+    }
+
     res.json({ ok: true });
   }),
 );

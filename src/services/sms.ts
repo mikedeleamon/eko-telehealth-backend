@@ -6,8 +6,14 @@
  */
 import { configured, env } from '../config/env';
 
-/** Termii wants MSISDN in international format without '+': e.g. 2348012345678. */
-function normalizeMsisdn(raw: string): string {
+/**
+ * Termii wants MSISDN in international format without '+': e.g. 2348012345678.
+ *
+ * Exported because `users.phone` is stored in exactly this form: signup and SMS
+ * password reset have to agree on one representation, or a number typed as
+ * 0803… at signup would never match 234803… at reset.
+ */
+export function normalizeMsisdn(raw: string): string {
   let digits = raw.replace(/\D/g, '');
   if (digits.startsWith('0')) digits = env.termii.defaultCountryCode + digits.slice(1);
   return digits;
