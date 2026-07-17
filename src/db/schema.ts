@@ -21,6 +21,11 @@ export const users = pgTable('users', {
   passwordHash: text('password_hash').notNull(),
   role: text('role').$type<'Patient' | 'Doctor' | 'Admin'>().notNull().default('Patient'),
   status: text('status').$type<'active' | 'suspended'>().notNull().default('active'),
+  // Set by /auth/verify once the signup email OTP is confirmed. Lets /auth/signup
+  // tell a genuine duplicate apart from a signup that was never finished (the
+  // user backed out to fix a field) — the latter updates the row in place
+  // instead of 409ing.
+  emailVerified: boolean('email_verified').notNull().default(false),
   joinedAt: timestamp('joined_at', { withTimezone: true }).defaultNow().notNull(),
 });
 

@@ -93,26 +93,36 @@ router.post(
     const phone = input.phone ? normalizeMsisdn(input.phone) : null;
 
     const [existing] = await db.select().from(users).where(eq(users.email, email));
-    if (existing) throw new HttpError(409, 'An account with this email already exists.');
+    // A row already sitting under this email is only a real conflict once its
+    // owner has verified it. An unverified row means a prior signup that never
+    // finished (e.g. the user backed out to fix a field) — resubmitting should
+    // update that pending row in place, not 409.
+    if (existing && existing.emailVerified) {
+      throw new HttpError(409, 'An account with this email already exists.');
+    }
     if (phone) {
       // Enforced here as well as by the unique index, so the caller gets a
       // useful message instead of a raw constraint violation.
       const [taken] = await db.select().from(users).where(eq(users.phone, phone));
-      if (taken) throw new HttpError(409, 'An account with this phone number already exists.');
+      if (taken && taken.id !== existing?.id) {
+        throw new HttpError(409, 'An account with this phone number already exists.');
+      }
     }
 
-    const [user] = await db
-      .insert(users)
-      .values({
-        firstName: input.firstName,
-        lastName: input.lastName,
-        email,
-        phone,
-        passwordHash: await hashPassword(input.password),
-        role: input.role,
-      })
-      .returning();
-    res.status(201).json(sessionResponse(user!));
+    const values = {
+      firstName: input.firstName,
+      lastName: input.lastName,
+      email,
+      phone,
+      passwordHash: await hashPassword(input.password),
+      role: input.role,
+    };
+
+    const [user] = existing
+      ? await db.update(users).set(values).where(eq(users.id, existing.id)).returning()
+      : await db.insert(users).values(values).returning();
+
+    res.status(existing ? 200 : 201).json(sessionResponse(user!));
   }),
 );
 
@@ -230,7 +240,14 @@ router.post(
     const { channel, destination, code } = z
       .object({ channel: channelSchema, destination: z.string().min(1), code: z.string().min(4) })
       .parse(req.body);
-    await checkCode(normalizeDestination(destination, channel), channel, code);
+    const dest = normalizeDestination(destination, channel);
+    await checkCode(dest, channel, code);
+    if (channel === 'email') {
+      // Closes the loop with /auth/signup's pending-row check: once this
+      // fires, the account is no longer eligible to be silently overwritten
+      // by a later signup attempt under the same email.
+      await getDb().update(users).set({ emailVerified: true }).where(eq(users.email, dest));
+    }
     res.json({ ok: true });
   }),
 );
