@@ -36,6 +36,7 @@ async function seed() {
   await db.delete(s.reviews);
   await db.delete(s.providerApplications);
   await db.delete(s.verificationCodes);
+  await db.delete(s.pendingSignups);
   await db.delete(s.dependents);
   await db.delete(s.insuranceInfo);
   await db.delete(s.pharmacyPreferences);

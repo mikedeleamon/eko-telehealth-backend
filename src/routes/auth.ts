@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { and, desc, eq, gte } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { users, verificationCodes, type UserRow } from '../db/schema';
+import { pendingSignups, users, verificationCodes, type UserRow } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler } from '../lib/http';
 import { signSession } from '../lib/jwt';
@@ -92,21 +92,16 @@ router.post(
     const email = input.email.toLowerCase();
     const phone = input.phone ? normalizeMsisdn(input.phone) : null;
 
+    // Every users row is a verified account, so any hit is a genuine conflict.
+    // Nothing here ever writes to `users` — an unverified signup must not be
+    // able to touch, let alone overwrite, a real account.
     const [existing] = await db.select().from(users).where(eq(users.email, email));
-    // A row already sitting under this email is only a real conflict once its
-    // owner has verified it. An unverified row means a prior signup that never
-    // finished (e.g. the user backed out to fix a field) — resubmitting should
-    // update that pending row in place, not 409.
-    if (existing && existing.emailVerified) {
-      throw new HttpError(409, 'An account with this email already exists.');
-    }
+    if (existing) throw new HttpError(409, 'An account with this email already exists.');
     if (phone) {
-      // Enforced here as well as by the unique index, so the caller gets a
+      // Checked here as well as by the unique index, so the caller gets a
       // useful message instead of a raw constraint violation.
       const [taken] = await db.select().from(users).where(eq(users.phone, phone));
-      if (taken && taken.id !== existing?.id) {
-        throw new HttpError(409, 'An account with this phone number already exists.');
-      }
+      if (taken) throw new HttpError(409, 'An account with this phone number already exists.');
     }
 
     const values = {
@@ -118,11 +113,15 @@ router.post(
       role: input.role,
     };
 
-    const [user] = existing
-      ? await db.update(users).set(values).where(eq(users.id, existing.id)).returning()
-      : await db.insert(users).values(values).returning();
+    // Re-submitting replaces the pending row, so going back to fix a field and
+    // saving again resumes the signup instead of colliding with it.
+    await db
+      .insert(pendingSignups)
+      .values(values)
+      .onConflictDoUpdate({ target: pendingSignups.email, set: { ...values, createdAt: new Date() } });
 
-    res.status(existing ? 200 : 201).json(sessionResponse(user!));
+    // No session: the caller is not an account holder until they verify.
+    res.status(201).json({ ok: true });
   }),
 );
 
@@ -242,15 +241,52 @@ router.post(
       .parse(req.body);
     const dest = normalizeDestination(destination, channel);
     await checkCode(dest, channel, code);
-    if (channel === 'email') {
-      // Closes the loop with /auth/signup's pending-row check: once this
-      // fires, the account is no longer eligible to be silently overwritten
-      // by a later signup attempt under the same email.
-      await getDb().update(users).set({ emailVerified: true }).where(eq(users.email, dest));
-    }
+    if (channel === 'email') await promotePendingSignup(dest);
     res.json({ ok: true });
   }),
 );
+
+/**
+ * Turn a verified pending signup into a real account. This is the only place a
+ * user row is created, which is what guarantees an account always has a
+ * verified email behind it.
+ *
+ * A no-op when there's no pending row: /auth/verify also serves the password
+ * reset flow, where the account already exists.
+ */
+async function promotePendingSignup(email: string): Promise<void> {
+  const db = getDb();
+  const [pending] = await db.select().from(pendingSignups).where(eq(pendingSignups.email, email));
+  if (!pending) return;
+
+  const [already] = await db.select().from(users).where(eq(users.email, email));
+  if (already) {
+    // Someone completed this signup already (e.g. a double-submitted code).
+    await db.delete(pendingSignups).where(eq(pendingSignups.email, email));
+    return;
+  }
+
+  // Re-check the phone: it was free at signup but may have been claimed by an
+  // account that verified in the meantime, and users.phone is unique.
+  let phone = pending.phone;
+  if (phone) {
+    const [taken] = await db.select().from(users).where(eq(users.phone, phone));
+    // Drop it rather than fail the verification — the account is still valid,
+    // it just loses SMS reset until a phone is set from the profile screen.
+    if (taken) phone = null;
+  }
+
+  await db.insert(users).values({
+    firstName: pending.firstName,
+    lastName: pending.lastName,
+    email: pending.email,
+    phone,
+    passwordHash: pending.passwordHash,
+    role: pending.role,
+    emailVerified: true,
+  });
+  await db.delete(pendingSignups).where(eq(pendingSignups.email, email));
+}
 
 /**
  * POST /auth/reset-password — set a new password using a code from

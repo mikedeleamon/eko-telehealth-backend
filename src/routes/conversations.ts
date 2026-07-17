@@ -101,6 +101,16 @@ router.get(
     const [conv] = await db.select().from(conversations).where(eq(conversations.id, param(req, 'id')));
     if (!conv) throw new HttpError(404, 'Conversation not found');
 
+    // Membership check. Knowing a conversation id must not be enough to read
+    // it: without this, any signed-in user could pull anyone's consultation
+    // transcript. 404 rather than 403 so ids can't be probed for existence.
+    if (conv.patientId !== req.user!.id) {
+      const [doctorProfile] = await db.select().from(doctors).where(eq(doctors.userId, req.user!.id));
+      if (!doctorProfile || doctorProfile.id !== conv.doctorId) {
+        throw new HttpError(404, 'Conversation not found');
+      }
+    }
+
     const rows = await db
       .select()
       .from(messages)

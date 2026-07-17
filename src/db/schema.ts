@@ -21,10 +21,9 @@ export const users = pgTable('users', {
   passwordHash: text('password_hash').notNull(),
   role: text('role').$type<'Patient' | 'Doctor' | 'Admin'>().notNull().default('Patient'),
   status: text('status').$type<'active' | 'suspended'>().notNull().default('active'),
-  // Set by /auth/verify once the signup email OTP is confirmed. Lets /auth/signup
-  // tell a genuine duplicate apart from a signup that was never finished (the
-  // user backed out to fix a field) — the latter updates the row in place
-  // instead of 409ing.
+  // True for every row by construction: accounts are only created by
+  // /auth/verify promoting a pending_signups row, so a user cannot exist
+  // without a verified email. Kept as an explicit record of that.
   emailVerified: boolean('email_verified').notNull().default(false),
   joinedAt: timestamp('joined_at', { withTimezone: true }).defaultNow().notNull(),
 });
@@ -194,6 +193,32 @@ export const reviews = pgTable('reviews', {
   submittedAt: text('submitted_at').notNull(),
   status: text('status').$type<'pending' | 'published' | 'removed'>().notNull().default('pending'),
   // submittedAt is a display string; this is the real sort key.
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Signups awaiting email verification.
+ *
+ * Deliberately NOT in `users`: an unfinished signup must not create a real
+ * account. Keeping it here means a half-finished signup holds no session and no
+ * data, and re-submitting one (the user went back to fix a field) replaces this
+ * row instead of colliding with a real account. /auth/verify promotes a row
+ * here into `users` and deletes it — the only path that creates an account.
+ */
+export const pendingSignups = pgTable('pending_signups', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  /** Lowercased, matching users.email. Unique so a resubmit upserts. */
+  email: text('email').notNull().unique(),
+  firstName: text('first_name').notNull(),
+  lastName: text('last_name').notNull(),
+  /**
+   * Normalized MSISDN. NOT unique (unlike users.phone): two abandoned signups
+   * may share a number, and blocking that would let anyone permanently reserve
+   * someone else's phone. Uniqueness is re-checked when promoting to `users`.
+   */
+  phone: text('phone'),
+  passwordHash: text('password_hash').notNull(),
+  role: text('role').$type<'Patient' | 'Doctor'>().notNull().default('Patient'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
