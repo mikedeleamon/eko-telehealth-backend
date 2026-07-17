@@ -9,6 +9,7 @@ import callRoutes from './routes/calls';
 import chatRoutes from './routes/chat';
 import conversationRoutes from './routes/conversations';
 import doctorRoutes from './routes/doctors';
+import meRoutes from './routes/me';
 import notificationRoutes from './routes/notifications';
 import paymentRoutes from './routes/payments';
 import practiceRoutes from './routes/practice';
@@ -62,6 +63,7 @@ export function createApp() {
   app.use('/payments', paymentRoutes);
   app.use('/calls', callRoutes);
   app.use('/chat', chatRoutes);
+  app.use('/me', meRoutes);
   app.use('/providers', providerRoutes);
   app.use('/reviews', reviewRoutes);
   app.use('/uploads', uploadRoutes);
