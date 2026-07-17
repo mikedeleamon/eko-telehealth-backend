@@ -24,6 +24,8 @@ async function seed() {
   const db = getDb();
 
   console.log('Clearing existing data…');
+  // Children before parents — every table referencing users/doctors must be
+  // cleared first or the foreign keys block the delete.
   await db.delete(s.messages);
   await db.delete(s.notifications);
   await db.delete(s.agendaItems);
@@ -34,6 +36,10 @@ async function seed() {
   await db.delete(s.reviews);
   await db.delete(s.providerApplications);
   await db.delete(s.verificationCodes);
+  await db.delete(s.dependents);
+  await db.delete(s.insuranceInfo);
+  await db.delete(s.pharmacyPreferences);
+  await db.delete(s.userSettings);
   await db.delete(s.doctors);
   await db.delete(s.users);
 
@@ -79,10 +85,17 @@ async function seed() {
 
   console.log('Seeding appointments…');
   await db.insert(s.appointments).values([
+    // Two rows sit mid-lifecycle so the demo has something to act on: the
+    // doctor can Accept/Decline the pending_approval one, and the patient can
+    // pay the pending_payment one.
+    { patientId: martin.id, doctorId: amara.id, doctorName: amara.name, specialty: 'Primary Care', date: 'Fri, Jul 24, 2026', time: '9:30 AM', type: 'Video Visit', status: 'pending_approval', fee: amara.fee },
+    { patientId: martin.id, doctorId: chinedu.id, doctorName: chinedu.name, specialty: 'Eye Doctor', date: 'Thu, Jul 23, 2026', time: '4:00 PM', type: 'Clinic Visit', status: 'pending_payment', fee: chinedu.fee, acceptedAt: hoursAgo(3) },
     { patientId: martin.id, doctorId: amara.id, doctorName: amara.name, specialty: 'Primary Care', date: 'Mon, Jun 29, 2026', time: '10:00 AM', type: 'Video Visit', status: 'upcoming', fee: amara.fee },
     { patientId: martin.id, doctorId: chinedu.id, doctorName: chinedu.name, specialty: 'Eye Doctor', date: 'Wed, Jul 2, 2026', time: '2:30 PM', type: 'Clinic Visit', status: 'upcoming', fee: chinedu.fee },
     { patientId: martin.id, doctorId: funmi.id, doctorName: funmi.name, specialty: 'OBGYN', date: 'May 15, 2026', time: '11:00 AM', type: 'Video Visit', status: 'past', fee: funmi.fee },
     { patientId: martin.id, doctorId: whitfield.id, doctorName: whitfield.name, specialty: 'Cardiology', date: 'Apr 28, 2026', time: '3:00 PM', type: 'Clinic Visit', status: 'past', fee: whitfield.fee },
+    // Emeka's request is pending so Dr. Amara's practice queue isn't empty.
+    { patientId: emeka.id, doctorId: amara.id, doctorName: amara.name, specialty: 'Primary Care', date: 'Fri, Jul 24, 2026', time: '11:00 AM', type: 'Video Visit', status: 'pending_approval', fee: amara.fee },
     { patientId: emeka.id, doctorId: chinedu.id, doctorName: chinedu.name, specialty: 'Eye Doctor', date: 'Mon, Jul 6, 2026', time: '2:30 PM', type: 'Clinic Visit', status: 'upcoming', fee: chinedu.fee },
     { patientId: ngozi.id, doctorId: funmi.id, doctorName: funmi.name, specialty: 'OBGYN', date: 'Jul 5, 2026', time: '11:00 AM', type: 'Video Visit', status: 'past', fee: funmi.fee },
   ]);

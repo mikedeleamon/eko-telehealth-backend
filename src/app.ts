@@ -12,6 +12,7 @@ import doctorRoutes from './routes/doctors';
 import notificationRoutes from './routes/notifications';
 import paymentRoutes from './routes/payments';
 import practiceRoutes from './routes/practice';
+import providerRoutes from './routes/providers';
 import reviewRoutes from './routes/reviews';
 import uploadRoutes from './routes/uploads';
 import webhookRoutes from './routes/webhooks';
@@ -61,6 +62,7 @@ export function createApp() {
   app.use('/payments', paymentRoutes);
   app.use('/calls', callRoutes);
   app.use('/chat', chatRoutes);
+  app.use('/providers', providerRoutes);
   app.use('/reviews', reviewRoutes);
   app.use('/uploads', uploadRoutes);
 

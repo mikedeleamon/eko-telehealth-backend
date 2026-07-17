@@ -50,10 +50,27 @@ export const appointments = pgTable('appointments', {
   date: text('date').notNull(),
   time: text('time').notNull(),
   type: text('type').$type<'Video Visit' | 'Clinic Visit' | 'Home Visit'>().notNull(),
-  status: text('status').$type<'upcoming' | 'past' | 'cancelled'>().notNull().default('upcoming'),
+  /**
+   * Booking lifecycle:
+   *   pending_approval → the doctor has not accepted yet (initial state)
+   *   pending_payment  → accepted; awaiting the patient's payment
+   *   upcoming         → paid + confirmed (set only by a verified payment webhook)
+   *   declined         → the doctor rejected the request
+   *   cancelled        → the patient cancelled
+   *   past             → the visit happened
+   */
+  status: text('status')
+    .$type<'pending_approval' | 'pending_payment' | 'upcoming' | 'declined' | 'cancelled' | 'past'>()
+    .notNull()
+    .default('pending_approval'),
   reason: text('reason'),
-  dependentId: text('dependent_id'),
+  /** Set when booking on behalf of a dependent (proxy access). */
+  dependentId: uuid('dependent_id'),
   fee: text('fee'),
+  /** Why the doctor declined — shown to the patient. */
+  declineReason: text('decline_reason'),
+  /** When the doctor accepted; starts the payment window. */
+  acceptedAt: timestamp('accepted_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -79,6 +96,12 @@ export const messages = pgTable('messages', {
     .references(() => users.id)
     .notNull(),
   text: text('text').notNull(),
+  /**
+   * Stream's own message id. Stream ids are arbitrary strings, so they cannot
+   * live in the uuid PK above — the webhook used to write them there and every
+   * insert threw. Unique so webhook retries dedupe on it instead.
+   */
+  streamId: text('stream_id').unique(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -133,15 +156,26 @@ export const payments = pgTable('payments', {
 /** Admin verification queue (GET /admin/providers/applications). */
 export const providerApplications = pgTable('provider_applications', {
   id: uuid('id').defaultRandom().primaryKey(),
+  /**
+   * The applicant's account. Nullable because seeded/back-office applications
+   * predate self-service; approval can only create a linked doctors row when
+   * this is set.
+   */
+  userId: uuid('user_id').references(() => users.id),
   name: text('name').notNull(),
   type: text('type').$type<'Doctor' | 'Nurse' | 'Pharmacy' | 'Lab' | 'Therapist' | 'Clinic'>().notNull(),
   specialty: text('specialty').notNull(),
+  /** Search bucket for the doctors row created on approval (e.g. "Cardiology"). */
+  category: text('category'),
+  /** Display fee carried onto the doctors row, e.g. "₦15,000". */
+  fee: text('fee'),
   location: text('location').notNull(),
   submittedAt: text('submitted_at').notNull(),
   checkGovId: boolean('check_gov_id').notNull().default(false),
   checkEmail: boolean('check_email').notNull().default(false),
   checkPhone: boolean('check_phone').notNull().default(false),
   status: text('status').$type<'pending' | 'approved' | 'rejected'>().notNull().default('pending'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
 /** Admin two-way review moderation queue (GET /admin/reviews). */
@@ -173,6 +207,70 @@ export const verificationCodes = pgTable('verification_codes', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
+/**
+ * People a patient can book on behalf of (proxy access). appointments
+ * .dependentId points here; the visit still belongs to the account holder.
+ */
+export const dependents = pgTable('dependents', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull(),
+  firstName: text('first_name').notNull(),
+  lastName: text('last_name').notNull(),
+  /** Display string, matching how the app collects it (DD-MM-YYYY). */
+  dob: text('dob').notNull(),
+  relationship: text('relationship'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/** One insurance record per user (GET/PUT /me/insurance). */
+export const insuranceInfo = pgTable('insurance_info', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull()
+    .unique(),
+  provider: text('provider').notNull(),
+  memberId: text('member_id').notNull(),
+  groupNumber: text('group_number'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/** One preferred pharmacy per user (GET/PUT /me/pharmacy). */
+export const pharmacyPreferences = pgTable('pharmacy_preferences', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull()
+    .unique(),
+  name: text('name'),
+  address: text('address').notNull(),
+  fax: text('fax').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Per-user preferences (GET/PATCH /me/settings). Notification flags are
+ * advisory for future push/email fan-out — OTP and other transactional
+ * messages are always delivered regardless of these.
+ */
+export const userSettings = pgTable('user_settings', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull()
+    .unique(),
+  pushNotifications: boolean('push_notifications').notNull().default(true),
+  emailNotifications: boolean('email_notifications').notNull().default(true),
+  smsNotifications: boolean('sms_notifications').notNull().default(false),
+  darkMode: boolean('dark_mode').notNull().default(false),
+  locationAccess: boolean('location_access').notNull().default(true),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
 export type UserRow = typeof users.$inferSelect;
 export type DoctorRow = typeof doctors.$inferSelect;
 export type AppointmentRow = typeof appointments.$inferSelect;
+export type DependentRow = typeof dependents.$inferSelect;
+export type UserSettingsRow = typeof userSettings.$inferSelect;

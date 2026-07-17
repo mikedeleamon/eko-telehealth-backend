@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { configured, env } from '../config/env';
 import { getDb } from '../db/client';
 import { appointments, conversations, doctors, messages, payments } from '../db/schema';
@@ -8,16 +8,35 @@ import { notify } from '../services/notify';
 import { capturePaypalOrder, verifyPaypalWebhook } from '../services/payments/paypal';
 import { verifyStreamWebhook } from '../services/stream';
 
-/** Payment settled: notify the patient who booked the appointment. */
-async function notifyPaymentSucceeded(appointmentId: string): Promise<void> {
+/**
+ * A verified payment succeeded — confirm the visit and tell the patient.
+ *
+ * This is the ONLY place an appointment becomes 'upcoming'. Guarded on
+ * 'pending_payment' so a late or duplicate webhook can't resurrect a visit the
+ * patient cancelled (or re-confirm one already confirmed) after the fact.
+ */
+async function confirmPaidAppointment(appointmentId: string): Promise<void> {
   const db = getDb();
-  const [appt] = await db.select().from(appointments).where(eq(appointments.id, appointmentId));
-  if (appt) {
-    await notify(
-      appt.patientId,
-      'Payment Successful',
-      `Your payment of ${appt.fee} for the visit with ${appt.doctorName} has been processed.`,
-    );
+  const [appt] = await db
+    .update(appointments)
+    .set({ status: 'upcoming' })
+    .where(and(eq(appointments.id, appointmentId), eq(appointments.status, 'pending_payment')))
+    .returning();
+
+  if (!appt) {
+    console.warn(`[webhook] payment settled for appointment ${appointmentId}, but it was not awaiting payment — not confirming.`);
+    return;
+  }
+  await notify(
+    appt.patientId,
+    'Appointment Confirmed',
+    `Your payment of ${appt.fee} was received. Your visit with ${appt.doctorName} on ${appt.date} at ${appt.time} is confirmed.`,
+  );
+  if (appt.doctorId) {
+    const [doc] = await db.select().from(doctors).where(eq(doctors.id, appt.doctorId));
+    if (doc?.userId) {
+      await notify(doc.userId, 'Visit Confirmed', `The ${appt.date} ${appt.time} visit is paid and confirmed.`);
+    }
   }
 }
 
@@ -63,8 +82,7 @@ router.post(
         .where(eq(payments.id, txRef))
         .returning();
       if (paid && payment?.appointmentId) {
-        await db.update(appointments).set({ status: 'upcoming' }).where(eq(appointments.id, payment.appointmentId));
-        await notifyPaymentSucceeded(payment.appointmentId);
+        await confirmPaidAppointment(payment.appointmentId);
       }
     }
     res.json({ received: true });
@@ -142,8 +160,7 @@ router.post(
         .where(eq(payments.id, paymentId))
         .returning();
       if (captureOutcome === 'succeeded' && payment?.appointmentId) {
-        await db.update(appointments).set({ status: 'upcoming' }).where(eq(appointments.id, payment.appointmentId));
-        await notifyPaymentSucceeded(payment.appointmentId);
+        await confirmPaidAppointment(payment.appointmentId);
       }
     }
 
@@ -185,13 +202,16 @@ router.post(
           await db
             .insert(messages)
             .values({
-              id: message.id, // dedupe webhook retries on Stream's message id
+              // Stream's id is an arbitrary string, so it goes in streamId (a
+              // unique text column) — not the uuid PK, which previously made
+              // every one of these inserts throw.
+              streamId: message.id,
               conversationId: channelId,
               senderId,
               text: message.text ?? '',
               createdAt: message.created_at ? new Date(message.created_at) : new Date(),
             })
-            .onConflictDoNothing();
+            .onConflictDoNothing({ target: messages.streamId }); // dedupe retries
           await db
             .update(conversations)
             .set({

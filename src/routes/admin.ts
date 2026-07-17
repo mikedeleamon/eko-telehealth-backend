@@ -7,6 +7,7 @@ import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatJoined, formatNaira } from '../lib/format';
 import { requireAuth, requireRole } from '../middleware/auth';
+import { notify } from '../services/notify';
 
 const router = Router();
 // NOTE: the admin site still needs a login screen (integration guide, Step 5).
@@ -65,7 +66,14 @@ router.get(
   }),
 );
 
-/** POST /admin/providers/applications/:id/decision */
+/**
+ * POST /admin/providers/applications/:id/decision
+ *
+ * Approving a Doctor application is what actually creates the bookable
+ * `doctors` row and links it to the applicant's account — this is the only
+ * path from "signed up as a Doctor" to "appears in search". Idempotent: a
+ * second approval won't create a duplicate profile.
+ */
 router.post(
   '/providers/applications/:id/decision',
   asyncHandler(async (req, res) => {
@@ -77,7 +85,42 @@ router.post(
       .where(eq(providerApplications.id, param(req, 'id')))
       .returning();
     if (!row) throw new HttpError(404, 'Application not found');
-    res.json({ ok: true });
+
+    let doctorId: string | undefined;
+    if (decision === 'approved' && row.type === 'Doctor' && row.userId) {
+      const [existing] = await db.select().from(doctors).where(eq(doctors.userId, row.userId));
+      if (existing) {
+        doctorId = existing.id;
+      } else {
+        const [created] = await db
+          .insert(doctors)
+          .values({
+            userId: row.userId,
+            name: row.name,
+            specialty: row.specialty,
+            category: row.category ?? row.specialty,
+            location: row.location,
+            fee: row.fee ?? '₦15,000',
+            available: true,
+            nextAvailable: '',
+          })
+          .returning();
+        doctorId = created!.id;
+      }
+      await notify(
+        row.userId,
+        'Application Approved',
+        'Your provider application was approved — your profile is now live and patients can book you.',
+      );
+    } else if (decision === 'rejected' && row.userId) {
+      await notify(
+        row.userId,
+        'Application Not Approved',
+        'Your provider application was not approved. Contact support if you think this is a mistake.',
+      );
+    }
+
+    res.json({ ok: true, doctorId });
   }),
 );
 
