@@ -5,12 +5,12 @@ import { getDb } from '../db/client';
 import { agendaItems, appointments, doctors, rosterPatients, users } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
-import { requireAuth, requireRole } from '../middleware/auth';
+import { requireAuth, requireAccountType } from '../middleware/auth';
 import { notify } from '../services/notify';
 import { toAppointment } from './appointments';
 
 const router = Router();
-router.use(requireAuth, requireRole('Doctor', 'Admin'));
+router.use(requireAuth, requireAccountType('Doctor', 'Admin'));
 
 /** Resolve the doctor profile linked to the signed-in doctor user (if any). */
 async function doctorIdFor(userId: string): Promise<string | null> {

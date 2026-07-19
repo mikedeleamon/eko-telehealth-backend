@@ -60,7 +60,7 @@ router.post(
       })
       .parse(req.body);
 
-    if (req.user!.role !== 'Doctor') {
+    if (req.user!.accountType !== 'Doctor') {
       throw new HttpError(403, 'Only accounts registered as a Doctor can apply.');
     }
 

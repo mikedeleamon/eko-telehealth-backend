@@ -6,14 +6,14 @@ import { appointments, doctors, payments, providerApplications, reviews, users }
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatJoined, formatNaira } from '../lib/format';
-import { requireAuth, requireRole } from '../middleware/auth';
+import { requireAuth, requireAccountType } from '../middleware/auth';
 import { notify } from '../services/notify';
 
 const router = Router();
 // NOTE: the admin site still needs a login screen (integration guide, Step 5).
 // Until then, sign in via POST /auth/login with the seeded Admin account to get
-// a token; this guard already enforces the Admin role on every admin route.
-router.use(requireAuth, requireRole('Admin'));
+// a token; this guard already enforces the Admin account type on every admin route.
+router.use(requireAuth, requireAccountType('Admin'));
 
 /** GET /admin/stats — dashboard counters. */
 router.get(
@@ -23,7 +23,7 @@ router.get(
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
     const [[patients], [providers], [weekAppts], [revenue], [pendingVer], [pendingRev]] = await Promise.all([
-      db.select({ value: count() }).from(users).where(eq(users.role, 'Patient')),
+      db.select({ value: count() }).from(users).where(eq(users.accountType, 'Patient')),
       db.select({ value: count() }).from(doctors),
       db.select({ value: count() }).from(appointments).where(gte(appointments.createdAt, weekAgo)),
       db
@@ -158,14 +158,14 @@ router.get(
     const rows = await db
       .select()
       .from(users)
-      .where(inArray(users.role, ['Patient', 'Doctor']))
+      .where(inArray(users.accountType, ['Patient', 'Doctor']))
       .orderBy(desc(users.joinedAt));
     res.json(
       rows.map((u) => ({
         id: u.id,
         name: `${u.firstName} ${u.lastName}`,
         email: u.email,
-        role: u.role,
+        accountType: u.accountType,
         joined: formatJoined(u.joinedAt),
         status: u.status,
       })),

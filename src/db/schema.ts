@@ -19,7 +19,9 @@ export const users = pgTable('users', {
   // predate phone capture and reset by email instead.
   phone: text('phone').unique(),
   passwordHash: text('password_hash').notNull(),
-  role: text('role').$type<'Patient' | 'Doctor' | 'Admin'>().notNull().default('Patient'),
+  // The account's permission type. Resolved from this column at login; the
+  // client never sends it. Admins sign in through the admin console only.
+  accountType: text('account_type').$type<'Patient' | 'Doctor' | 'Admin'>().notNull().default('Patient'),
   status: text('status').$type<'active' | 'suspended'>().notNull().default('active'),
   // True for every row by construction: accounts are only created by
   // /auth/verify promoting a pending_signups row, so a user cannot exist
@@ -218,7 +220,7 @@ export const pendingSignups = pgTable('pending_signups', {
    */
   phone: text('phone'),
   passwordHash: text('password_hash').notNull(),
-  role: text('role').$type<'Patient' | 'Doctor'>().notNull().default('Patient'),
+  accountType: text('account_type').$type<'Patient' | 'Doctor'>().notNull().default('Patient'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 

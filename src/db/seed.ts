@@ -50,13 +50,13 @@ async function seed() {
   const insertedUsers = await db
     .insert(s.users)
     .values([
-      { firstName: 'Martin', lastName: 'Doe', email: 'martin@ekotelehealth.com', passwordHash, role: 'Patient', status: 'active', emailVerified: true },
-      { firstName: 'Amara', lastName: 'Okafor', email: 'a.okafor@ekotelehealth.com', passwordHash, role: 'Doctor', status: 'active', emailVerified: true },
-      { firstName: 'Eko', lastName: 'Admin', email: 'admin@ekotelehealth.com', passwordHash, role: 'Admin', status: 'active', emailVerified: true },
-      { firstName: 'Ngozi', lastName: 'Nwosu', email: 'ngozi.n@gmail.com', passwordHash, role: 'Patient', status: 'active', emailVerified: true },
-      { firstName: 'Chinedu', lastName: 'Eze', email: 'c.eze@ekotelehealth.com', passwordHash, role: 'Doctor', status: 'active', emailVerified: true },
-      { firstName: 'Tunde', lastName: 'Bakare', email: 'tunde.b@yahoo.com', passwordHash, role: 'Patient', status: 'suspended', emailVerified: true },
-      { firstName: 'Emeka', lastName: 'Obi', email: 'emeka.obi@gmail.com', passwordHash, role: 'Patient', status: 'active', emailVerified: true },
+      { firstName: 'Martin', lastName: 'Doe', email: 'martin@ekotelehealth.com', passwordHash, accountType: 'Patient', status: 'active', emailVerified: true },
+      { firstName: 'Amara', lastName: 'Okafor', email: 'a.okafor@ekotelehealth.com', passwordHash, accountType: 'Doctor', status: 'active', emailVerified: true },
+      { firstName: 'Eko', lastName: 'Admin', email: 'admin@ekotelehealth.com', passwordHash, accountType: 'Admin', status: 'active', emailVerified: true },
+      { firstName: 'Ngozi', lastName: 'Nwosu', email: 'ngozi.n@gmail.com', passwordHash, accountType: 'Patient', status: 'active', emailVerified: true },
+      { firstName: 'Chinedu', lastName: 'Eze', email: 'c.eze@ekotelehealth.com', passwordHash, accountType: 'Doctor', status: 'active', emailVerified: true },
+      { firstName: 'Tunde', lastName: 'Bakare', email: 'tunde.b@yahoo.com', passwordHash, accountType: 'Patient', status: 'suspended', emailVerified: true },
+      { firstName: 'Emeka', lastName: 'Obi', email: 'emeka.obi@gmail.com', passwordHash, accountType: 'Patient', status: 'active', emailVerified: true },
     ])
     .returning();
   const userByEmail = Object.fromEntries(insertedUsers.map((u) => [u.email, u] as const));

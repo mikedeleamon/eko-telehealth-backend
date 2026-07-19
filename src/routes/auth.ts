@@ -12,7 +12,7 @@ import { sendEmail } from '../services/email';
 import { normalizeMsisdn, sendSms } from '../services/sms';
 
 const router = Router();
-const roleSchema = z.enum(['Patient', 'Doctor']);
+const accountTypeSchema = z.enum(['Patient', 'Doctor']);
 const channelSchema = z.enum(['email', 'sms']);
 
 /** Wrong guesses allowed against a destination before its codes are burned. */
@@ -32,14 +32,14 @@ function normalizeDestination(destination: string, channel: 'email' | 'sms'): st
 
 /** Shape the { user, accessToken, refreshToken } payload both clients expect. */
 function sessionResponse(user: UserRow) {
-  const { accessToken, refreshToken } = signSession({ id: user.id, role: user.role, email: user.email });
+  const { accessToken, refreshToken } = signSession({ id: user.id, accountType: user.accountType, email: user.email });
   return {
     user: {
       id: user.id,
       firstName: user.firstName,
       lastName: user.lastName,
       email: user.email,
-      role: user.role,
+      accountType: user.accountType,
     },
     accessToken,
     refreshToken,
@@ -50,10 +50,11 @@ function sessionResponse(user: UserRow) {
 router.post(
   '/login',
   asyncHandler(async (req, res) => {
-    const { email, password, role } = z
-      // role is optional: the mobile app sends it (Patient/Doctor) and we enforce
-      // it; the admin console omits it and authenticates on credentials alone.
-      .object({ email: z.string().email(), password: z.string().min(1), role: roleSchema.optional() })
+    const { email, password, accountType } = z
+      // accountType is optional and legacy: the account's type is resolved from
+      // the stored account, not chosen at sign-in. When supplied it's still
+      // enforced (older callers), but neither client sends it anymore.
+      .object({ email: z.string().email(), password: z.string().min(1), accountType: accountTypeSchema.optional() })
       .parse(req.body);
 
     const db = getDb();
@@ -62,9 +63,9 @@ router.post(
       throw new HttpError(401, 'Invalid email or password');
     }
     if (user.status === 'suspended') throw new HttpError(403, 'This account has been suspended.');
-    // When a role is supplied it must match (Admins may sign in through either client).
-    if (role && user.role !== role && user.role !== 'Admin') {
-      throw new HttpError(403, `This account is not registered as a ${role}.`);
+    // When an account type is supplied it must match (Admins may sign in through either client).
+    if (accountType && user.accountType !== accountType && user.accountType !== 'Admin') {
+      throw new HttpError(403, `This account is not registered as a ${accountType}.`);
     }
     res.json(sessionResponse(user));
   }),
@@ -80,7 +81,7 @@ router.post(
         lastName: z.string().min(1),
         email: z.string().email(),
         password: z.string().min(6),
-        role: roleSchema,
+        accountType: accountTypeSchema,
         // Optional so seeded/admin accounts (which have none) stay valid; the
         // mobile signup form always sends one. Without it, SMS reset can't
         // resolve the account and the user must reset by email.
@@ -110,7 +111,7 @@ router.post(
       email,
       phone,
       passwordHash: await hashPassword(input.password),
-      role: input.role,
+      accountType: input.accountType,
     };
 
     // Re-submitting replaces the pending row, so going back to fix a field and
@@ -282,7 +283,7 @@ async function promotePendingSignup(email: string): Promise<void> {
     email: pending.email,
     phone,
     passwordHash: pending.passwordHash,
-    role: pending.role,
+    accountType: pending.accountType,
     emailVerified: true,
   });
   await db.delete(pendingSignups).where(eq(pendingSignups.email, email));
@@ -377,7 +378,7 @@ router.patch(
       firstName: user.firstName,
       lastName: user.lastName,
       email: user.email,
-      role: user.role,
+      accountType: user.accountType,
     });
   }),
 );

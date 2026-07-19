@@ -63,7 +63,7 @@ router.post(
       .values({
         author: authorName,
         subject,
-        direction: req.user!.role === 'Doctor' ? 'provider→patient' : 'patient→provider',
+        direction: req.user!.accountType === 'Doctor' ? 'provider→patient' : 'patient→provider',
         rating,
         text,
         submittedAt,

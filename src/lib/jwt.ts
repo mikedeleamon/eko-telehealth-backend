@@ -1,23 +1,23 @@
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
 
-export type Role = 'Patient' | 'Doctor' | 'Admin';
+export type AccountType = 'Patient' | 'Doctor' | 'Admin';
 
 export interface AccessPayload {
   sub: string;
-  role: Role;
+  accountType: AccountType;
   email: string;
 }
 
 interface SessionUser {
   id: string;
-  role: Role;
+  accountType: AccountType;
   email: string;
 }
 
 /** Mint the access + refresh pair returned by /auth/login and /auth/signup. */
 export function signSession(user: SessionUser): { accessToken: string; refreshToken: string } {
-  const accessToken = jwt.sign({ role: user.role, email: user.email }, env.jwt.accessSecret, {
+  const accessToken = jwt.sign({ accountType: user.accountType, email: user.email }, env.jwt.accessSecret, {
     subject: user.id,
     expiresIn: env.jwt.accessTtl,
   });
@@ -30,7 +30,7 @@ export function signSession(user: SessionUser): { accessToken: string; refreshTo
 
 export function verifyAccess(token: string): AccessPayload {
   const decoded = jwt.verify(token, env.jwt.accessSecret) as jwt.JwtPayload;
-  return { sub: String(decoded.sub), role: decoded.role as Role, email: String(decoded.email) };
+  return { sub: String(decoded.sub), accountType: decoded.accountType as AccountType, email: String(decoded.email) };
 }
 
 export function verifyRefresh(token: string): { sub: string } {
