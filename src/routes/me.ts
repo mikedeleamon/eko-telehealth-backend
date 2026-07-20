@@ -1,16 +1,22 @@
 import { Router } from 'express';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
 import {
   dependents,
+  documents,
   insuranceInfo,
+  labs,
   pharmacyPreferences,
+  prescriptions,
   userSettings,
   type DependentRow,
+  type DocumentRow,
   type UserSettingsRow,
 } from '../db/schema';
+import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
+import { insertLab, labInputSchema, toLab, toPrescription } from './practice';
 import { asyncHandler, param } from '../lib/http';
 import { requireAuth } from '../middleware/auth';
 
@@ -167,6 +173,149 @@ router.put(
       })
       .returning();
     res.json({ name: row!.name ?? undefined, address: row!.address, fax: row!.fax });
+  }),
+);
+
+// ── Documents & Certifications ──────────────────────────────────────────────
+
+/** Build the client's `url` from the stored R2 key + public base, when set. */
+function documentUrl(storageKey: string | null): string | null {
+  if (!storageKey) return null;
+  const base = env.r2.publicBaseUrl;
+  return base ? `${base.replace(/\/$/, '')}/${storageKey}` : storageKey;
+}
+
+function toDocument(d: DocumentRow) {
+  return {
+    id: d.id,
+    name: d.name,
+    category: d.category,
+    fileName: d.fileName,
+    mimeType: d.mimeType,
+    sizeBytes: d.sizeBytes,
+    url: documentUrl(d.storageKey),
+    uploadedAt: d.uploadedAt,
+    createdAt: d.createdAt.toISOString(),
+  };
+}
+
+/** GET /me/documents — the user's uploaded credentials, newest first. */
+router.get(
+  '/documents',
+  asyncHandler(async (req, res) => {
+    const rows = await getDb()
+      .select()
+      .from(documents)
+      .where(eq(documents.userId, req.user!.id))
+      .orderBy(desc(documents.createdAt));
+    res.json(rows.map(toDocument));
+  }),
+);
+
+/**
+ * POST /me/documents — record a document already uploaded to R2 via
+ * /uploads/presign. The client sends the returned object key plus metadata;
+ * the backend never sees the bytes.
+ */
+router.post(
+  '/documents',
+  asyncHandler(async (req, res) => {
+    const input = z
+      .object({
+        name: z.string().min(1).max(120),
+        category: z.enum(['license', 'certification', 'government-id', 'insurance', 'other']),
+        fileName: z.string().min(1).max(200),
+        mimeType: z.string().min(1).max(120),
+        sizeBytes: z.number().int().nonnegative(),
+        key: z.string().min(1).optional(),
+      })
+      .parse(req.body);
+
+    const uploadedAt = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const [row] = await getDb()
+      .insert(documents)
+      .values({
+        userId: req.user!.id,
+        name: input.name,
+        category: input.category,
+        fileName: input.fileName,
+        mimeType: input.mimeType,
+        sizeBytes: input.sizeBytes,
+        storageKey: input.key ?? null,
+        uploadedAt,
+      })
+      .returning();
+    res.status(201).json(toDocument(row!));
+  }),
+);
+
+/** DELETE /me/documents/:id — scoped to the owner. */
+router.delete(
+  '/documents/:id',
+  asyncHandler(async (req, res) => {
+    const [row] = await getDb()
+      .delete(documents)
+      .where(and(eq(documents.id, param(req, 'id')), eq(documents.userId, req.user!.id)))
+      .returning();
+    if (!row) throw new HttpError(404, 'Document not found');
+    res.json({ ok: true });
+  }),
+);
+
+// ── Prescriptions (patient self-view) ───────────────────────────────────────
+
+/**
+ * GET /me/prescriptions — the signed-in patient's own medication record
+ * (current + historical), read-only. Scoped to req.user.id; only a prescriber
+ * can add to it (via /practice/patients/:id/prescriptions).
+ */
+router.get(
+  '/prescriptions',
+  asyncHandler(async (req, res) => {
+    const rows = await getDb()
+      .select()
+      .from(prescriptions)
+      .where(eq(prescriptions.patientId, req.user!.id))
+      .orderBy(desc(prescriptions.createdAt));
+    res.json(rows.map(toPrescription));
+  }),
+);
+
+// ── Labs (patient self) ─────────────────────────────────────────────────────
+
+/** GET /me/labs — the signed-in patient's own lab results. */
+router.get(
+  '/labs',
+  asyncHandler(async (req, res) => {
+    const rows = await getDb()
+      .select()
+      .from(labs)
+      .where(eq(labs.patientId, req.user!.id))
+      .orderBy(desc(labs.createdAt));
+    res.json(rows.map(toLab));
+  }),
+);
+
+/** POST /me/labs — patient logs their own result (e.g. an outside test). */
+router.post(
+  '/labs',
+  asyncHandler(async (req, res) => {
+    const input = labInputSchema.parse(req.body);
+    const row = await insertLab(req.user!.id, input);
+    res.status(201).json(toLab(row));
+  }),
+);
+
+/** DELETE /me/labs/:id — scoped to the owner. */
+router.delete(
+  '/labs/:id',
+  asyncHandler(async (req, res) => {
+    const [row] = await getDb()
+      .delete(labs)
+      .where(and(eq(labs.id, param(req, 'id')), eq(labs.patientId, req.user!.id)))
+      .returning();
+    if (!row) throw new HttpError(404, 'Lab result not found');
+    res.json({ ok: true });
   }),
 );
 

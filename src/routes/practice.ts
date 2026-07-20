@@ -2,7 +2,9 @@ import { Router } from 'express';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { agendaItems, appointments, doctors, rosterPatients, users } from '../db/schema';
+import { agendaItems, appointments, doctors, labs, medicalNotes, prescriptions, rosterPatients, users, type LabRow, type MedicalNoteRow, type NoteAmendment, type PrescriptionRow } from '../db/schema';
+import { randomUUID } from 'node:crypto';
+import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { requireAuth, requireAccountType } from '../middleware/auth';
@@ -17,6 +19,47 @@ async function doctorIdFor(userId: string): Promise<string | null> {
   const db = getDb();
   const [row] = await db.select().from(doctors).where(eq(doctors.userId, userId));
   return row?.id ?? null;
+}
+
+/**
+ * Resolve a roster-patient id (what doctor-facing screens pass in the URL) to
+ * the real account id doctor-authored records should be stored/queried
+ * against — so a patient with an app account sees them in their own self-view
+ * (/me/prescriptions, /me/labs). Unlinked roster entries (walk-ins, demo-only
+ * names) resolve to themselves, exactly as before this link existed.
+ *
+ * Self-healing: when not yet linked, tries a one-shot match — a patient user
+ * who has a real appointment with this doctor AND whose name matches the
+ * roster entry exactly (case-insensitive). The appointment is the proof the
+ * two rows are the same person; ambiguous or no match is left unlinked rather
+ * than guessing wrong. Once linked, the match is persisted and skipped next
+ * time.
+ */
+async function resolvePatientId(rosterId: string): Promise<string> {
+  const db = getDb();
+  const [roster] = await db.select().from(rosterPatients).where(eq(rosterPatients.id, rosterId));
+  if (!roster) return rosterId; // not a roster row — use as-is (defensive, shouldn't happen)
+  if (roster.userId) return roster.userId;
+
+  const patientIds = [
+    ...new Set(
+      (
+        await db
+          .select({ patientId: appointments.patientId })
+          .from(appointments)
+          .where(eq(appointments.doctorId, roster.doctorId))
+      ).map((a) => a.patientId),
+    ),
+  ];
+  if (!patientIds.length) return rosterId;
+
+  const candidates = await db.select().from(users).where(inArray(users.id, patientIds));
+  const target = roster.name.trim().toLowerCase();
+  const matches = candidates.filter((u) => `${u.firstName} ${u.lastName}`.trim().toLowerCase() === target);
+  if (matches.length !== 1) return rosterId; // no match or ambiguous — stay unlinked
+
+  await db.update(rosterPatients).set({ userId: matches[0].id }).where(eq(rosterPatients.id, rosterId));
+  return matches[0].id;
 }
 
 /**
@@ -133,6 +176,372 @@ router.post(
       `${existing.doctorName} accepted your ${existing.date} ${existing.time} request. Pay ${existing.fee ?? 'the fee'} to confirm it.`,
     );
     res.json(toAppointment(row!));
+  }),
+);
+
+// ── Medical notes (SOAP records) ────────────────────────────────────────────
+
+function toNote(n: MedicalNoteRow) {
+  return {
+    id: n.id,
+    patientId: n.patientId,
+    appointmentId: n.appointmentId,
+    date: n.date,
+    visitType: n.visitType ?? undefined,
+    doctorId: n.doctorId ?? '',
+    doctorName: n.doctorName,
+    doctorSpecialty: n.doctorSpecialty,
+    reason: n.reason,
+    subjective: n.subjective,
+    objective: n.objective,
+    assessment: n.assessment,
+    primaryDiagnosis: n.primaryDiagnosis ?? undefined,
+    secondaryDiagnoses: n.secondaryDiagnoses ?? [],
+    plan: n.plan,
+    status: n.status,
+    amendments: n.amendments ?? [],
+    createdAt: n.createdAt.toISOString(),
+    updatedAt: n.updatedAt?.toISOString(),
+  };
+}
+
+const noteInputSchema = z.object({
+  appointmentId: z.string().min(1),
+  date: z.string().min(1),
+  visitType: z.string().optional(),
+  reason: z.string().min(1),
+  subjective: z.string().default(''),
+  objective: z.string().default(''),
+  assessment: z.string().default(''),
+  primaryDiagnosis: z.string().optional(),
+  secondaryDiagnoses: z.array(z.string()).optional(),
+  plan: z.string().default(''),
+  status: z.enum(['draft', 'final']).default('final'),
+});
+
+/**
+ * GET /practice/patients/:patientId/notes — every note for the patient, shared
+ * across treating doctors. Drafts are private: only their author sees them.
+ */
+router.get(
+  '/patients/:patientId/notes',
+  asyncHandler(async (req, res) => {
+    const db = getDb();
+    const myDocId = await doctorIdFor(req.user!.id);
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const rows = await db
+      .select()
+      .from(medicalNotes)
+      .where(eq(medicalNotes.patientId, patientId))
+      .orderBy(desc(medicalNotes.createdAt));
+    const visible = rows.filter((n) => n.status === 'final' || (myDocId && n.doctorId === myDocId));
+    res.json(visible.map(toNote));
+  }),
+);
+
+/**
+ * POST /practice/patients/:patientId/notes — create a record (draft or final).
+ * Author identity is stamped from the signed-in doctor, never sent by the client.
+ */
+router.post(
+  '/patients/:patientId/notes',
+  asyncHandler(async (req, res) => {
+    const input = noteInputSchema.parse(req.body);
+    const db = getDb();
+    const docId = await doctorIdFor(req.user!.id);
+    const [doc] = docId ? await db.select().from(doctors).where(eq(doctors.id, docId)) : [];
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const [row] = await db
+      .insert(medicalNotes)
+      .values({
+        patientId,
+        appointmentId: input.appointmentId,
+        date: input.date,
+        visitType: input.visitType ?? null,
+        doctorId: docId,
+        doctorName: doc?.name ?? req.user!.email,
+        doctorSpecialty: doc?.specialty ?? '',
+        reason: input.reason,
+        subjective: input.subjective,
+        objective: input.objective,
+        assessment: input.assessment,
+        primaryDiagnosis: input.primaryDiagnosis ?? null,
+        secondaryDiagnoses: input.secondaryDiagnoses ?? [],
+        plan: input.plan,
+        status: input.status,
+      })
+      .returning();
+    res.status(201).json(toNote(row!));
+  }),
+);
+
+/**
+ * PATCH /practice/notes/:noteId — update a DRAFT (save-draft-again or finalize
+ * by sending status:'final'). Only the author can edit, and only while it's a
+ * draft: a finalized record is immutable (amend it instead).
+ */
+router.patch(
+  '/notes/:noteId',
+  asyncHandler(async (req, res) => {
+    const input = noteInputSchema.parse(req.body);
+    const db = getDb();
+    const docId = await doctorIdFor(req.user!.id);
+    const [existing] = await db.select().from(medicalNotes).where(eq(medicalNotes.id, param(req, 'noteId')));
+    if (!existing) throw new HttpError(404, 'Record not found');
+    if (!docId || existing.doctorId !== docId) throw new HttpError(404, 'Record not found');
+    if (existing.status === 'final') throw new HttpError(409, 'A finalized record cannot be edited. Add an amendment instead.');
+
+    const [row] = await db
+      .update(medicalNotes)
+      .set({
+        appointmentId: input.appointmentId,
+        date: input.date,
+        visitType: input.visitType ?? null,
+        reason: input.reason,
+        subjective: input.subjective,
+        objective: input.objective,
+        assessment: input.assessment,
+        primaryDiagnosis: input.primaryDiagnosis ?? null,
+        secondaryDiagnoses: input.secondaryDiagnoses ?? [],
+        plan: input.plan,
+        status: input.status,
+        updatedAt: new Date(),
+      })
+      .where(eq(medicalNotes.id, existing.id))
+      .returning();
+    res.json(toNote(row!));
+  }),
+);
+
+/**
+ * POST /practice/notes/:noteId/amendments — append an amendment to a locked
+ * record. The SOAP body is never touched. Author is stamped server-side.
+ */
+router.post(
+  '/notes/:noteId/amendments',
+  asyncHandler(async (req, res) => {
+    const { text } = z.object({ text: z.string().min(1).max(2000) }).parse(req.body);
+    const db = getDb();
+    const [existing] = await db.select().from(medicalNotes).where(eq(medicalNotes.id, param(req, 'noteId')));
+    if (!existing) throw new HttpError(404, 'Record not found');
+
+    const [author] = await db.select().from(users).where(eq(users.id, req.user!.id));
+    const amendment: NoteAmendment = {
+      id: randomUUID(),
+      text,
+      authorId: req.user!.id,
+      authorName: author ? `${author.firstName} ${author.lastName}` : req.user!.email,
+      createdAt: new Date().toISOString(),
+    };
+    const [row] = await db
+      .update(medicalNotes)
+      .set({ amendments: [...(existing.amendments ?? []), amendment], updatedAt: new Date() })
+      .where(eq(medicalNotes.id, existing.id))
+      .returning();
+    res.json(toNote(row!));
+  }),
+);
+
+// ── Prescriptions ───────────────────────────────────────────────────────────
+
+/** Map a prescription row to the client shape. */
+export function toPrescription(p: PrescriptionRow) {
+  return {
+    id: p.id,
+    patientId: p.patientId,
+    drug: p.drug,
+    strength: p.strength,
+    form: p.form,
+    route: p.route,
+    frequency: p.frequency,
+    duration: p.duration,
+    quantity: p.quantity,
+    refills: p.refills,
+    instructions: p.instructions ?? undefined,
+    status: p.status,
+    doctorId: p.doctorId ?? '',
+    doctorName: p.doctorName,
+    datePrescribed: p.datePrescribed,
+    createdAt: p.createdAt.toISOString(),
+  };
+}
+
+/**
+ * GET /practice/patients/:patientId/prescriptions — the patient's full
+ * medication record (current + historical), shared across treating doctors.
+ */
+router.get(
+  '/patients/:patientId/prescriptions',
+  asyncHandler(async (req, res) => {
+    const db = getDb();
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const rows = await db
+      .select()
+      .from(prescriptions)
+      .where(eq(prescriptions.patientId, patientId))
+      .orderBy(desc(prescriptions.createdAt));
+    res.json(rows.map(toPrescription));
+  }),
+);
+
+/**
+ * POST /practice/patients/:patientId/prescriptions — write a new prescription
+ * (becomes a current medication). The prescriber is stamped server-side from
+ * the signed-in doctor, never sent by the client.
+ */
+router.post(
+  '/patients/:patientId/prescriptions',
+  asyncHandler(async (req, res) => {
+    const input = z
+      .object({
+        drug: z.string().min(1),
+        strength: z.string().min(1),
+        form: z.string().min(1),
+        route: z.string().min(1),
+        frequency: z.string().min(1),
+        duration: z.string().min(1),
+        quantity: z.string().min(1),
+        refills: z.string().min(1),
+        instructions: z.string().max(500).optional(),
+      })
+      .parse(req.body);
+
+    const db = getDb();
+    const docId = await doctorIdFor(req.user!.id);
+    const [doc] = docId ? await db.select().from(doctors).where(eq(doctors.id, docId)) : [];
+    const doctorName = doc?.name ?? `${req.user!.email}`;
+    const datePrescribed = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+
+    const [row] = await db
+      .insert(prescriptions)
+      .values({
+        patientId,
+        ...input,
+        instructions: input.instructions ?? null,
+        status: 'active',
+        doctorId: docId,
+        doctorName,
+        datePrescribed,
+      })
+      .returning();
+    res.status(201).json(toPrescription(row!));
+  }),
+);
+
+// ── Labs ────────────────────────────────────────────────────────────────────
+
+/** Build the client `attachmentUrl` from the stored R2 key + public base. */
+function labAttachmentUrl(key: string | null): string | null {
+  if (!key) return null;
+  const base = env.r2.publicBaseUrl;
+  return base ? `${base.replace(/\/$/, '')}/${key}` : key;
+}
+
+export function toLab(l: LabRow) {
+  return {
+    id: l.id,
+    patientId: l.patientId,
+    testName: l.testName,
+    loincCode: l.loincCode ?? undefined,
+    specimen: l.specimen,
+    value: l.value,
+    unit: l.unit ?? undefined,
+    referenceRange: l.referenceRange ?? undefined,
+    flag: l.flag,
+    status: l.status,
+    orderedBy: l.orderedBy ?? undefined,
+    performingLab: l.performingLab ?? undefined,
+    collectedDate: l.collectedDate,
+    resultedDate: l.resultedDate ?? undefined,
+    notes: l.notes ?? undefined,
+    attachmentUrl: labAttachmentUrl(l.attachmentKey),
+    attachmentName: l.attachmentName ?? undefined,
+    createdAt: l.createdAt.toISOString(),
+  };
+}
+
+/** Shared body validation for adding a lab (patient self + doctor surfaces). */
+export const labInputSchema = z.object({
+  testName: z.string().min(1).max(160),
+  loincCode: z.string().max(20).optional(),
+  specimen: z.string().min(1).max(80),
+  value: z.string().min(1).max(80),
+  unit: z.string().max(40).optional(),
+  referenceRange: z.string().max(80).optional(),
+  flag: z.enum(['normal', 'low', 'high', 'critical', 'abnormal']),
+  status: z.enum(['ordered', 'collected', 'resulted']),
+  orderedBy: z.string().max(120).optional(),
+  performingLab: z.string().max(120).optional(),
+  collectedDate: z.string().min(1).max(40),
+  resultedDate: z.string().max(40).optional(),
+  notes: z.string().max(1000).optional(),
+  attachmentKey: z.string().max(300).optional(),
+  attachmentName: z.string().max(200).optional(),
+});
+
+/** Insert a lab for the given patient id (roster id or user id). */
+export async function insertLab(patientId: string, input: z.infer<typeof labInputSchema>) {
+  const [row] = await getDb()
+    .insert(labs)
+    .values({
+      patientId,
+      testName: input.testName,
+      loincCode: input.loincCode ?? null,
+      specimen: input.specimen,
+      value: input.value,
+      unit: input.unit ?? null,
+      referenceRange: input.referenceRange ?? null,
+      flag: input.flag,
+      status: input.status,
+      orderedBy: input.orderedBy ?? null,
+      performingLab: input.performingLab ?? null,
+      collectedDate: input.collectedDate,
+      resultedDate: input.resultedDate ?? null,
+      notes: input.notes ?? null,
+      attachmentKey: input.attachmentKey ?? null,
+      attachmentName: input.attachmentName ?? null,
+    })
+    .returning();
+  return row!;
+}
+
+/** GET /practice/patients/:patientId/labs — a patient's lab results. */
+router.get(
+  '/patients/:patientId/labs',
+  asyncHandler(async (req, res) => {
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const rows = await getDb()
+      .select()
+      .from(labs)
+      .where(eq(labs.patientId, patientId))
+      .orderBy(desc(labs.createdAt));
+    res.json(rows.map(toLab));
+  }),
+);
+
+/** POST /practice/patients/:patientId/labs — add a lab result for the patient. */
+router.post(
+  '/patients/:patientId/labs',
+  asyncHandler(async (req, res) => {
+    const input = labInputSchema.parse(req.body);
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const row = await insertLab(patientId, input);
+    res.status(201).json(toLab(row));
+  }),
+);
+
+/** DELETE /practice/patients/:patientId/labs/:id */
+router.delete(
+  '/patients/:patientId/labs/:id',
+  asyncHandler(async (req, res) => {
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const [row] = await getDb()
+      .delete(labs)
+      .where(and(eq(labs.id, param(req, 'id')), eq(labs.patientId, patientId)))
+      .returning();
+    if (!row) throw new HttpError(404, 'Lab result not found');
+    res.json({ ok: true });
   }),
 );
 

@@ -15,10 +15,16 @@ router.post(
   '/presign',
   asyncHandler(async (req, res) => {
     const { kind, contentType } = z
-      .object({ kind: z.enum(['avatar', 'provider-doc']), contentType: z.string().min(1) })
+      .object({ kind: z.enum(['avatar', 'provider-doc', 'document', 'lab']), contentType: z.string().min(1) })
       .parse(req.body);
 
-    const prefix = kind === 'avatar' ? `avatars/${req.user!.id}` : `provider-docs/${req.user!.id}`;
+    const PREFIXES: Record<typeof kind, string> = {
+      avatar: `avatars/${req.user!.id}`,
+      'provider-doc': `provider-docs/${req.user!.id}`,
+      document: `documents/${req.user!.id}`,
+      lab: `labs/${req.user!.id}`,
+    };
+    const prefix = PREFIXES[kind];
     const result = await presignUpload(prefix, contentType);
     res.json(result);
   }),

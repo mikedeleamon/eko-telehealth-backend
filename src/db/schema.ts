@@ -6,7 +6,16 @@
  * keys, so the mobile app and admin console work unchanged. Run
  * `npm run db:push` to apply this to your Supabase database.
  */
-import { boolean, doublePrecision, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { boolean, doublePrecision, integer, jsonb, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+
+/** An append-only addendum stored in medical_notes.amendments (jsonb array). */
+export interface NoteAmendment {
+  id: string;
+  text: string;
+  authorId: string;
+  authorName: string;
+  createdAt: string;
+}
 
 export const users = pgTable('users', {
   id: uuid('id').defaultRandom().primaryKey(),
@@ -132,6 +141,15 @@ export const rosterPatients = pgTable('roster_patients', {
   gender: text('gender').notNull(),
   condition: text('condition').notNull(),
   lastVisit: text('last_visit').notNull(),
+  /**
+   * The real account this roster entry belongs to, when the patient has one.
+   * Nullable — many roster entries are walk-ins or demo-only names with no
+   * app account. When set, doctor-authored records (prescriptions, labs,
+   * medical notes) are stored against THIS id instead of the roster row's own
+   * id, so they surface in the patient's own self-view (/me/*). See
+   * resolvePatientId in routes/practice.ts.
+   */
+  userId: uuid('user_id').references(() => users.id),
 });
 
 /** Doctor-side agenda rows (GET /practice/agenda). */
@@ -191,7 +209,13 @@ export const reviews = pgTable('reviews', {
   subject: text('subject').notNull(),
   direction: text('direction').$type<'patient→provider' | 'provider→patient'>().notNull(),
   rating: integer('rating').notNull(),
+  /** Optional App Store-style headline for the review. */
+  title: text('title'),
   text: text('text').notNull(),
+  /** The author completed a consultation with the subject (badge on the card). */
+  verified: boolean('verified').notNull().default(false),
+  /** Display-only count of comments/replies on the review. */
+  commentsCount: integer('comments_count').notNull().default(0),
   submittedAt: text('submitted_at').notNull(),
   status: text('status').$type<'pending' | 'published' | 'removed'>().notNull().default('pending'),
   // submittedAt is a display string; this is the real sort key.
@@ -301,8 +325,116 @@ export const userSettings = pgTable('user_settings', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
+/**
+ * Doctor "Documents & Certifications" — uploaded credentials (license, board
+ * certifications, government ID, etc.). The file bytes live in R2; this row is
+ * the metadata. Scoped to the uploading user.
+ */
+export const documents = pgTable('documents', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull(),
+  name: text('name').notNull(),
+  category: text('category')
+    .$type<'license' | 'certification' | 'government-id' | 'insurance' | 'other'>()
+    .notNull()
+    .default('other'),
+  fileName: text('file_name').notNull(),
+  mimeType: text('mime_type').notNull(),
+  sizeBytes: integer('size_bytes').notNull().default(0),
+  /** R2 object key returned by the presign step; null in unusual states. */
+  storageKey: text('storage_key'),
+  uploadedAt: text('uploaded_at').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * A prescription on a patient's medication record. `patientId` holds a roster
+ * patient id when written by a doctor (practice routes) or a user id for a
+ * patient's own record (/me/prescriptions) — two different id spaces, so no FK.
+ * See the roster/users split noted on rosterPatients.
+ */
+export const prescriptions = pgTable('prescriptions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  patientId: uuid('patient_id').notNull(),
+  drug: text('drug').notNull(),
+  strength: text('strength').notNull(),
+  form: text('form').notNull(),
+  route: text('route').notNull(),
+  frequency: text('frequency').notNull(),
+  duration: text('duration').notNull(),
+  quantity: text('quantity').notNull(),
+  refills: text('refills').notNull(),
+  instructions: text('instructions'),
+  status: text('status').$type<'active' | 'completed' | 'discontinued'>().notNull().default('active'),
+  doctorId: uuid('doctor_id').references(() => doctors.id),
+  doctorName: text('doctor_name').notNull(),
+  datePrescribed: text('date_prescribed').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Lab results on a patient's record. Like prescriptions, `patientId` holds a
+ * roster-patient id (doctor-entered) or a user id (patient self-entered) — no
+ * FK. Fields follow lab record-keeping best practice.
+ */
+export const labs = pgTable('labs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  patientId: uuid('patient_id').notNull(),
+  testName: text('test_name').notNull(),
+  loincCode: text('loinc_code'),
+  specimen: text('specimen').notNull(),
+  value: text('value').notNull(),
+  unit: text('unit'),
+  referenceRange: text('reference_range'),
+  flag: text('flag').$type<'normal' | 'low' | 'high' | 'critical' | 'abnormal'>().notNull().default('normal'),
+  status: text('status').$type<'ordered' | 'collected' | 'resulted'>().notNull().default('resulted'),
+  orderedBy: text('ordered_by'),
+  performingLab: text('performing_lab'),
+  collectedDate: text('collected_date').notNull(),
+  resultedDate: text('resulted_date'),
+  notes: text('notes'),
+  /** R2 object key + original file name for an attached report, when present. */
+  attachmentKey: text('attachment_key'),
+  attachmentName: text('attachment_name'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * SOAP-format medical records, shared across a patient's treating doctors.
+ * A 'final' record is immutable — corrections are appended to `amendments`,
+ * never edited in place. A 'draft' record is still editable by its author.
+ * `patientId` holds a roster-patient id (no FK, like prescriptions/labs).
+ */
+export const medicalNotes = pgTable('medical_notes', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  patientId: uuid('patient_id').notNull(),
+  appointmentId: text('appointment_id').notNull(),
+  date: text('date').notNull(),
+  visitType: text('visit_type'),
+  doctorId: uuid('doctor_id').references(() => doctors.id),
+  doctorName: text('doctor_name').notNull(),
+  doctorSpecialty: text('doctor_specialty').notNull().default(''),
+  reason: text('reason').notNull(),
+  subjective: text('subjective').notNull().default(''),
+  objective: text('objective').notNull().default(''),
+  assessment: text('assessment').notNull().default(''),
+  primaryDiagnosis: text('primary_diagnosis'),
+  secondaryDiagnoses: jsonb('secondary_diagnoses').$type<string[]>().notNull().default([]),
+  plan: text('plan').notNull().default(''),
+  status: text('status').$type<'draft' | 'final'>().notNull().default('final'),
+  amendments: jsonb('amendments').$type<NoteAmendment[]>().notNull().default([]),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }),
+});
+
 export type UserRow = typeof users.$inferSelect;
 export type DoctorRow = typeof doctors.$inferSelect;
 export type AppointmentRow = typeof appointments.$inferSelect;
 export type DependentRow = typeof dependents.$inferSelect;
 export type UserSettingsRow = typeof userSettings.$inferSelect;
+export type DocumentRow = typeof documents.$inferSelect;
+export type PrescriptionRow = typeof prescriptions.$inferSelect;
+export type LabRow = typeof labs.$inferSelect;
+export type MedicalNoteRow = typeof medicalNotes.$inferSelect;

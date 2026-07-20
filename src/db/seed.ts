@@ -29,6 +29,10 @@ async function seed() {
   await db.delete(s.messages);
   await db.delete(s.notifications);
   await db.delete(s.agendaItems);
+  await db.delete(s.prescriptions);
+  await db.delete(s.labs);
+  await db.delete(s.medicalNotes);
+  await db.delete(s.documents);
   await db.delete(s.rosterPatients);
   await db.delete(s.payments);
   await db.delete(s.appointments);
@@ -128,20 +132,78 @@ async function seed() {
   ]);
 
   console.log('Seeding doctor roster + agenda…');
-  await db.insert(s.rosterPatients).values([
-    { doctorId: amara.id, name: 'Emeka Obi', age: 34, gender: 'Male', condition: 'Hypertension', lastVisit: 'Jun 20, 2026' },
+  const insertedRoster = await db.insert(s.rosterPatients).values([
+    // Linked to the real Emeka user below (he has an appointment with Amara),
+    // demonstrating the roster↔account link: his prescriptions/labs/notes are
+    // seeded under his real user id so they show up in his own self-view too.
+    // Ngozi and Tunde below share names with real seeded users but have no
+    // appointment with Amara, so — correctly — they stay unlinked.
+    { doctorId: amara.id, name: 'Emeka Obi', age: 34, gender: 'Male', condition: 'Hypertension', lastVisit: 'Jun 20, 2026', userId: emeka.id },
     { doctorId: amara.id, name: 'Yusuf Ibrahim', age: 28, gender: 'Male', condition: 'First Visit', lastVisit: 'New patient' },
     { doctorId: amara.id, name: 'Alex Stewart', age: 45, gender: 'Male', condition: 'Diabetes Type 2', lastVisit: 'Jun 12, 2026' },
     { doctorId: amara.id, name: 'Augustine Watts', age: 52, gender: 'Female', condition: 'Migraine', lastVisit: 'Jun 5, 2026' },
     { doctorId: amara.id, name: 'Ngozi Nwosu', age: 31, gender: 'Female', condition: 'Pregnancy care', lastVisit: 'May 29, 2026' },
     { doctorId: amara.id, name: 'Tunde Bakare', age: 40, gender: 'Male', condition: 'Annual checkup', lastVisit: 'May 14, 2026' },
-  ]);
+  ]).returning();
+  const rosterByName = Object.fromEntries(insertedRoster.map((p) => [p.name, p] as const));
+  const alexRoster = rosterByName['Alex Stewart'];
   await db.insert(s.agendaItems).values([
     { doctorId: amara.id, name: 'Emeka Obi', type: 'Consultation', time: '12:30 pm', status: 'confirmed' },
     { doctorId: amara.id, name: 'Yusuf Ibrahim', type: 'First Visit', time: '11:30 am', status: 'cancelled' },
     { doctorId: amara.id, name: 'Bisi Alade', type: 'Consultation', time: '12:30 pm', status: 'rescheduled' },
     { doctorId: amara.id, name: 'Augustine Watts', type: 'Consultation', time: '10:30 am', status: 'pending' },
     { doctorId: amara.id, name: 'Emeka Obi', type: 'Consultation', time: '12:30 pm', status: 'confirmed' },
+  ]);
+
+  console.log('Seeding prescriptions…');
+  await db.insert(s.prescriptions).values([
+    // Martin's own record — powers the patient-facing Prescriptions tab
+    // (GET /me/prescriptions, keyed by user id).
+    { patientId: martin.id, drug: 'Cetirizine', strength: '10 mg', form: 'Tablet', route: 'Oral', frequency: 'Once daily', duration: 'Ongoing', quantity: '30', refills: '2', instructions: 'Take one tablet daily for seasonal allergies.', status: 'active', doctorId: amara.id, doctorName: amara.name, datePrescribed: 'Jul 4, 2026' },
+    { patientId: martin.id, drug: 'Omeprazole', strength: '20 mg', form: 'Capsule', route: 'Oral', frequency: 'Once daily', duration: '28 days', quantity: '28', refills: '1', instructions: 'Take 30 minutes before breakfast.', status: 'active', doctorId: amara.id, doctorName: amara.name, datePrescribed: 'Jun 20, 2026' },
+    { patientId: martin.id, drug: 'Amoxicillin', strength: '500 mg', form: 'Capsule', route: 'Oral', frequency: 'Three times daily', duration: '7 days', quantity: '21', refills: '0', instructions: 'Completed course for chest infection.', status: 'completed', doctorId: amara.id, doctorName: amara.name, datePrescribed: 'Mar 12, 2026' },
+    // Roster-patient records — power the doctor's Prescription History screen
+    // (GET /practice/patients/:rosterId/prescriptions, keyed by roster id).
+    { patientId: emeka.id, drug: 'Amlodipine', strength: '10 mg', form: 'Tablet', route: 'Oral', frequency: 'Once daily', duration: 'Ongoing', quantity: '30', refills: '3', instructions: 'Take one tablet in the morning with water.', status: 'active', doctorId: amara.id, doctorName: amara.name, datePrescribed: 'Jun 20, 2026' },
+    { patientId: emeka.id, drug: 'Hydrochlorothiazide', strength: '25 mg', form: 'Tablet', route: 'Oral', frequency: 'Once daily', duration: '90 days', quantity: '90', refills: '0', instructions: 'Discontinued — switched to amlodipine due to ankle oedema.', status: 'discontinued', doctorId: amara.id, doctorName: amara.name, datePrescribed: 'Feb 14, 2026' },
+    { patientId: alexRoster.id, drug: 'Metformin', strength: '1000 mg', form: 'Tablet', route: 'Oral', frequency: 'Twice daily', duration: 'Ongoing', quantity: '60', refills: '5', instructions: 'Take with breakfast and dinner to reduce GI upset.', status: 'active', doctorId: amara.id, doctorName: amara.name, datePrescribed: 'Jun 12, 2026' },
+  ]);
+
+  console.log('Seeding labs…');
+  await db.insert(s.labs).values([
+    // Martin's own results — power the patient Account → Labs screen (/me/labs).
+    { patientId: martin.id, testName: 'Fasting Blood Glucose', loincCode: '1558-6', specimen: 'Serum', value: '5.2', unit: 'mmol/L', referenceRange: '3.9–5.5', flag: 'normal', status: 'resulted', orderedBy: 'Dr. Amara Okafor', performingLab: 'Lagoon Clinical Labs', collectedDate: 'Jul 8, 2026', resultedDate: 'Jul 9, 2026', notes: 'Within normal limits.' },
+    { patientId: martin.id, testName: 'Total Cholesterol', loincCode: '2093-3', specimen: 'Serum', value: '6.1', unit: 'mmol/L', referenceRange: '< 5.2', flag: 'high', status: 'resulted', orderedBy: 'Dr. Amara Okafor', performingLab: 'Lagoon Clinical Labs', collectedDate: 'Jul 8, 2026', resultedDate: 'Jul 9, 2026', notes: 'Borderline high — advise dietary review.' },
+    { patientId: martin.id, testName: 'Haemoglobin (CBC)', loincCode: '718-7', specimen: 'Whole blood', value: '13.8', unit: 'g/dL', referenceRange: '13.0–17.0', flag: 'normal', status: 'resulted', orderedBy: 'Dr. Amara Okafor', performingLab: 'Lagoon Clinical Labs', collectedDate: 'Mar 2, 2026', resultedDate: 'Mar 3, 2026' },
+    // Roster-patient results — power the doctor's PatientProfile → Labs screen.
+    { patientId: emeka.id, testName: 'Serum Potassium', loincCode: '2823-3', specimen: 'Serum', value: '5.6', unit: 'mmol/L', referenceRange: '3.5–5.1', flag: 'high', status: 'resulted', orderedBy: 'Dr. Amara Okafor', performingLab: 'St. Nicholas Lab', collectedDate: 'Jun 18, 2026', resultedDate: 'Jun 19, 2026', notes: 'Recheck; review ACE inhibitor dose.' },
+    { patientId: alexRoster.id, testName: 'HbA1c', loincCode: '4548-4', specimen: 'Whole blood', value: '8.2', unit: '%', referenceRange: '< 7.0', flag: 'high', status: 'resulted', orderedBy: 'Dr. Amara Okafor', performingLab: 'St. Nicholas Lab', collectedDate: 'Jun 10, 2026', resultedDate: 'Jun 11, 2026', notes: 'Above target — intensify glycaemic control.' },
+  ]);
+
+  console.log('Seeding medical notes…');
+  await db.insert(s.medicalNotes).values([
+    {
+      patientId: emeka.id, appointmentId: 'seed-visit-1', date: 'Jun 20, 2026', visitType: 'Video Visit',
+      doctorId: amara.id, doctorName: amara.name, doctorSpecialty: amara.specialty,
+      reason: 'Hypertension follow-up',
+      subjective: 'Reports occasional morning headaches. Adherent to medication.',
+      objective: 'BP 148/92 mmHg, HR 78 bpm. No peripheral oedema.',
+      assessment: 'Essential hypertension', primaryDiagnosis: 'Essential hypertension',
+      secondaryDiagnoses: ['Obesity (BMI 31)'],
+      plan: 'Increase amlodipine to 10 mg daily. Recheck BP in 4 weeks.',
+      status: 'final',
+    },
+    {
+      patientId: alexRoster.id, appointmentId: 'seed-visit-2', date: 'Jun 12, 2026', visitType: 'Clinic Visit',
+      doctorId: amara.id, doctorName: amara.name, doctorSpecialty: amara.specialty,
+      reason: 'Diabetes review',
+      subjective: 'Fatigue in the afternoons. Home glucose 8–10 mmol/L.',
+      objective: 'HbA1c 8.2%. Feet: intact sensation.',
+      assessment: 'Type 2 diabetes mellitus, suboptimal control', primaryDiagnosis: 'Type 2 diabetes mellitus, suboptimal control',
+      secondaryDiagnoses: [],
+      plan: 'Add empagliflozin 10 mg daily. Dietitian referral. Repeat HbA1c in 3 months.',
+      status: 'final',
+    },
   ]);
 
   console.log('Seeding admin queues…');
@@ -155,6 +217,14 @@ async function seed() {
     { author: 'Martin D.', subject: 'Dr. Amara Okafor', direction: 'patient→provider', rating: 5, text: 'Very attentive and explained everything clearly. The video visit saved me a full day of travel.', submittedAt: 'Jul 4, 2026', status: 'pending' },
     { author: 'Dr. Chinedu Eze', subject: 'Yusuf I.', direction: 'provider→patient', rating: 4, text: 'Punctual and provided complete history ahead of the consultation.', submittedAt: 'Jul 3, 2026', status: 'pending' },
     { author: 'Ngozi N.', subject: 'Dr. James Whitfield', direction: 'patient→provider', rating: 2, text: 'Call started 25 minutes late and was cut short. Contact me at 0803-XXX-XXXX to discuss.', submittedAt: 'Jul 2, 2026', status: 'pending' },
+    // Published patient→provider reviews for the seeded live doctor, so the
+    // App Store-style reviews page has real data (average + distribution).
+    { author: 'Alex F.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 5, title: 'So many words, so little time', text: 'Excellent doctor! Very thorough and caring. Took the time to answer every one of my questions and never made me feel rushed. The follow-up notes were detailed and easy to understand.', verified: true, commentsCount: 100, submittedAt: 'Apr 16, 2026', status: 'published' },
+    { author: 'Alex S.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 5, title: 'Excellent work', text: 'Great experience overall. Short wait time and the video call was crystal clear. Prescriptions were sent to my pharmacy within the hour.', verified: true, commentsCount: 10, submittedAt: 'Jan 28, 2026', status: 'published' },
+    { author: 'Sam S.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 5, title: 'So many words', text: 'Highly recommend! Very knowledgeable and professional. Explained my diagnosis clearly and laid out every option before we decided on a plan together.', verified: true, commentsCount: 80, submittedAt: 'Jan 16, 2026', status: 'published' },
+    { author: 'Ada O.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 4, title: 'Really helpful', text: 'Solid consultation and genuinely helpful advice. Knocked a star off only because the app kept me waiting a couple of minutes past my slot.', verified: true, commentsCount: 4, submittedAt: 'Dec 30, 2025', status: 'published' },
+    { author: 'Tunde A.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 4, title: 'Would book again', text: 'Professional and friendly. Answered my follow-up message the same day.', verified: true, commentsCount: 2, submittedAt: 'Dec 12, 2025', status: 'published' },
+    { author: 'Ngozi E.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 3, title: 'Decent but rushed', text: 'The advice was fine but the call felt a little rushed towards the end.', verified: false, commentsCount: 1, submittedAt: 'Nov 20, 2025', status: 'published' },
   ]);
 
   console.log('\nSeed complete. Demo logins (password: Password123!):');
