@@ -57,6 +57,9 @@ router.post(
         category: z.string().min(2),
         location: z.string().min(2),
         fee: z.string().min(1),
+        // At least one — patients search by shared language (task 2.5), so
+        // an applicant with none would never be findable that way.
+        spokenLanguages: z.array(z.string()).min(1),
       })
       .parse(req.body);
 
@@ -90,6 +93,7 @@ router.post(
         category: input.category,
         fee: input.fee,
         location: input.location,
+        spokenLanguages: input.spokenLanguages,
         submittedAt: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
         // The admin verifies these; email is implicitly checked at signup.
         checkEmail: true,

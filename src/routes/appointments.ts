@@ -64,6 +64,11 @@ router.post(
     const db = getDb();
     const [doctor] = await db.select().from(doctors).where(eq(doctors.id, input.doctorId));
     if (!doctor) throw new HttpError(404, 'Doctor not found');
+    // In-home care is an admin-granted privilege (task 2.3) — checked here,
+    // not just hidden in the booking UI, so a request can't be forged past it.
+    if (input.type === 'Home Visit' && !doctor.canProvideInHome) {
+      throw new HttpError(409, `${doctor.name} is not certified for home visits.`);
+    }
 
     // A dependent must belong to the caller, or anyone could book against
     // someone else's dependent id.

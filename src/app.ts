@@ -7,6 +7,7 @@ import appointmentRoutes from './routes/appointments';
 import authRoutes from './routes/auth';
 import callRoutes from './routes/calls';
 import chatRoutes from './routes/chat';
+import complaintRoutes from './routes/complaints';
 import conversationRoutes from './routes/conversations';
 import doctorRoutes from './routes/doctors';
 import meRoutes from './routes/me';
@@ -66,6 +67,7 @@ export function createApp() {
   app.use('/me', meRoutes);
   app.use('/providers', providerRoutes);
   app.use('/reviews', reviewRoutes);
+  app.use('/complaints', complaintRoutes);
   app.use('/uploads', uploadRoutes);
 
   // Provider callbacks + admin console

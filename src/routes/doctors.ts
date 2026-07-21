@@ -21,6 +21,8 @@ function toDoctor(d: DoctorRow) {
     available: d.available,
     nextAvailable: d.nextAvailable,
     avatar: d.avatar,
+    canProvideInHome: d.canProvideInHome,
+    spokenLanguages: d.spokenLanguages,
   };
 }
 

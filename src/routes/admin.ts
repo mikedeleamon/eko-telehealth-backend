@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { count, desc, eq, gte, inArray, sum } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { appointments, doctors, payments, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
+import { appointments, complaints, doctors, payments, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatJoined, formatNaira } from '../lib/format';
@@ -23,7 +23,7 @@ router.get(
     const db = getDb();
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-    const [[patients], [providers], [weekAppts], [revenueAgg], [pendingVer], [pendingRev]] = await Promise.all([
+    const [[patients], [providers], [weekAppts], [revenueAgg], [pendingVer], [pendingRev], [pendingComp]] = await Promise.all([
       db.select({ value: count() }).from(users).where(eq(users.accountType, 'Patient')),
       db.select({ value: count() }).from(doctors),
       db.select({ value: count() }).from(appointments).where(gte(appointments.createdAt, weekAgo)),
@@ -43,6 +43,7 @@ router.get(
         .where(eq(payments.status, 'succeeded')),
       db.select({ value: count() }).from(providerApplications).where(eq(providerApplications.status, 'pending')),
       db.select({ value: count() }).from(reviews).where(eq(reviews.status, 'pending')),
+      db.select({ value: count() }).from(complaints).where(eq(complaints.status, 'pending')),
     ]);
 
     // Platform revenue = service charge + provider commission − discount.
@@ -61,6 +62,7 @@ router.get(
       vatCollected: formatNaira(vatCollected),
       pendingVerifications: pendingVer?.value ?? 0,
       pendingReviews: pendingRev?.value ?? 0,
+      pendingComplaints: pendingComp?.value ?? 0,
     });
   }),
 );
@@ -191,18 +193,55 @@ router.get(
   asyncHandler(async (_req, res) => {
     const db = getDb();
     const rows = await db.select().from(providerApplications);
+
+    // Resolve the linked doctors row for approved Doctor applications, so
+    // this same list can show/toggle their in-home privilege (task 2.3) —
+    // one batched query, not one per row.
+    const userIds = rows.filter((a) => a.type === 'Doctor' && a.userId).map((a) => a.userId!);
+    const linkedDoctors = userIds.length ? await db.select().from(doctors).where(inArray(doctors.userId, userIds)) : [];
+    const doctorByUserId = new Map(linkedDoctors.map((d) => [d.userId, d]));
+
     res.json(
-      rows.map((a) => ({
-        id: a.id,
-        name: a.name,
-        type: a.type,
-        specialty: a.specialty,
-        location: a.location,
-        submittedAt: a.submittedAt,
-        checks: { govId: a.checkGovId, email: a.checkEmail, phone: a.checkPhone },
-        status: a.status,
-      })),
+      rows.map((a) => {
+        const linked = a.userId ? doctorByUserId.get(a.userId) : undefined;
+        return {
+          id: a.id,
+          name: a.name,
+          type: a.type,
+          specialty: a.specialty,
+          location: a.location,
+          submittedAt: a.submittedAt,
+          checks: { govId: a.checkGovId, email: a.checkEmail, phone: a.checkPhone },
+          status: a.status,
+          // Only present once approval has actually created a bookable
+          // doctors row — undefined (not false) otherwise, so the admin UI
+          // can distinguish "not applicable" from "off".
+          doctorId: linked?.id,
+          canProvideInHome: linked?.canProvideInHome,
+          spokenLanguages: a.spokenLanguages,
+        };
+      }),
     );
+  }),
+);
+
+/**
+ * PATCH /admin/doctors/:id — toggle a bookable provider's in-home care
+ * privilege (task 2.3). Deliberately narrow — the only admin-editable doctor
+ * field today, not a general doctor-editing endpoint.
+ */
+router.patch(
+  '/doctors/:id',
+  asyncHandler(async (req, res) => {
+    const { canProvideInHome } = z.object({ canProvideInHome: z.boolean() }).parse(req.body);
+    const db = getDb();
+    const [row] = await db
+      .update(doctors)
+      .set({ canProvideInHome })
+      .where(eq(doctors.id, param(req, 'id')))
+      .returning();
+    if (!row) throw new HttpError(404, 'Provider not found');
+    res.json({ id: row.id, canProvideInHome: row.canProvideInHome });
   }),
 );
 
@@ -243,6 +282,7 @@ router.post(
             fee: row.fee ?? '₦15,000',
             available: true,
             nextAvailable: '',
+            spokenLanguages: row.spokenLanguages,
           })
           .returning();
         doctorId = created!.id;
@@ -286,6 +326,63 @@ router.post(
     const db = getDb();
     const [row] = await db.update(reviews).set({ status: decision }).where(eq(reviews.id, param(req, 'id'))).returning();
     if (!row) throw new HttpError(404, 'Review not found');
+    res.json({ ok: true });
+  }),
+);
+
+/** GET /admin/complaints?status=pending — support/report queue. */
+router.get(
+  '/complaints',
+  asyncHandler(async (req, res) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : 'pending';
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(complaints)
+      .where(eq(complaints.status, status as 'pending' | 'resolved' | 'dismissed'))
+      .orderBy(desc(complaints.createdAt));
+    res.json(
+      rows.map((c) => ({
+        id: c.id,
+        authorName: c.authorName,
+        accountType: c.accountType,
+        category: c.category,
+        subject: c.subject,
+        description: c.description,
+        appointmentId: c.appointmentId ?? undefined,
+        status: c.status,
+        resolutionNote: c.resolutionNote ?? undefined,
+        submittedAt: c.submittedAt,
+      })),
+    );
+  }),
+);
+
+/**
+ * POST /admin/complaints/:id/decision — resolve or dismiss a report, with an
+ * optional note. The filer is notified either way — a complaint that's only
+ * ever tracked internally, with no visible resolution, defeats the point.
+ */
+router.post(
+  '/complaints/:id/decision',
+  asyncHandler(async (req, res) => {
+    const { decision, resolutionNote } = z
+      .object({ decision: z.enum(['resolved', 'dismissed']), resolutionNote: z.string().max(2000).optional() })
+      .parse(req.body);
+    const db = getDb();
+    const [row] = await db
+      .update(complaints)
+      .set({ status: decision, resolutionNote: resolutionNote ?? null, resolvedAt: new Date() })
+      .where(eq(complaints.id, param(req, 'id')))
+      .returning();
+    if (!row) throw new HttpError(404, 'Report not found');
+
+    await notify(
+      row.userId,
+      decision === 'resolved' ? 'Your report has been resolved' : 'Update on your report',
+      resolutionNote || (decision === 'resolved' ? 'Your report has been marked resolved.' : 'Your report has been reviewed and closed.'),
+    );
+
     res.json({ ok: true });
   }),
 );

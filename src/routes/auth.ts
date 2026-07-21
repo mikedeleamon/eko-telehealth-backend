@@ -40,6 +40,7 @@ function sessionResponse(user: UserRow) {
       lastName: user.lastName,
       email: user.email,
       accountType: user.accountType,
+      spokenLanguages: user.spokenLanguages,
     },
     accessToken,
     refreshToken,
@@ -354,11 +355,15 @@ router.patch(
         firstName: z.string().min(1).optional(),
         lastName: z.string().min(1).optional(),
         phone: z.string().min(7).optional(),
+        // Who this account holder can communicate with (task 2.5) — distinct
+        // from the app's own display language (i18n). An empty array clears
+        // it, so this is checked against `undefined`, not truthiness.
+        spokenLanguages: z.array(z.string()).optional(),
       })
       .parse(req.body);
 
     const db = getDb();
-    const updates: Partial<{ firstName: string; lastName: string; phone: string }> = {};
+    const updates: Partial<{ firstName: string; lastName: string; phone: string; spokenLanguages: string[] }> = {};
     if (input.firstName) updates.firstName = input.firstName;
     if (input.lastName) updates.lastName = input.lastName;
     if (input.phone) {
@@ -369,6 +374,7 @@ router.patch(
       }
       updates.phone = phone;
     }
+    if (input.spokenLanguages !== undefined) updates.spokenLanguages = input.spokenLanguages;
     if (!Object.keys(updates).length) throw new HttpError(400, 'Nothing to update.');
 
     const [user] = await db.update(users).set(updates).where(eq(users.id, req.user!.id)).returning();
@@ -379,6 +385,7 @@ router.patch(
       lastName: user.lastName,
       email: user.email,
       accountType: user.accountType,
+      spokenLanguages: user.spokenLanguages,
     });
   }),
 );

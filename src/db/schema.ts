@@ -37,6 +37,13 @@ export const users = pgTable('users', {
   // without a verified email. Kept as an explicit record of that.
   emailVerified: boolean('email_verified').notNull().default(false),
   joinedAt: timestamp('joined_at', { withTimezone: true }).defaultNow().notNull(),
+  /**
+   * Languages this account holder speaks (task 2.5) — personal, editable
+   * anytime from EditProfileScreen (PATCH /auth/me). Distinct from the app's
+   * own display language (i18n, store/localeStore.ts) — this is about who
+   * they can communicate with, not which language the UI renders in.
+   */
+  spokenLanguages: jsonb('spoken_languages').$type<string[]>().notNull().default([]),
 });
 
 export const doctors = pgTable('doctors', {
@@ -52,6 +59,22 @@ export const doctors = pgTable('doctors', {
   available: boolean('available').notNull().default(true),
   nextAvailable: text('next_available').notNull().default(''),
   avatar: text('avatar'),
+  /**
+   * Admin-managed privilege (task 2.3) — a provider can only be booked for a
+   * Home Visit once this is on. Defaults false: in-home care is an
+   * explicitly granted privilege, not something every approved provider gets
+   * automatically. Enforced server-side in routes/appointments.ts, not just
+   * hidden client-side.
+   */
+  canProvideInHome: boolean('can_provide_in_home').notNull().default(false),
+  /**
+   * Languages this provider consults in (task 2.5) — what FilterScreen's
+   * language chips actually search against. Captured once at application
+   * (providerApplications.spokenLanguages) and carried onto this row on
+   * approval, same as specialty/fee/location — there's no self-service edit
+   * after that, consistent with those other fields.
+   */
+  spokenLanguages: jsonb('spoken_languages').$type<string[]>().notNull().default([]),
 });
 
 export const appointments = pgTable('appointments', {
@@ -310,6 +333,8 @@ export const providerApplications = pgTable('provider_applications', {
   /** Display fee carried onto the doctors row, e.g. "₦15,000". */
   fee: text('fee'),
   location: text('location').notNull(),
+  /** Carried onto the doctors row on approval (task 2.5) — see doctors.spokenLanguages. */
+  spokenLanguages: jsonb('spoken_languages').$type<string[]>().notNull().default([]),
   submittedAt: text('submitted_at').notNull(),
   checkGovId: boolean('check_gov_id').notNull().default(false),
   checkEmail: boolean('check_email').notNull().default(false),
@@ -336,6 +361,35 @@ export const reviews = pgTable('reviews', {
   status: text('status').$type<'pending' | 'published' | 'removed'>().notNull().default('pending'),
   // submittedAt is a display string; this is the real sort key.
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Complaint / support-issue tracking (task 2.1). A trackable alternative to
+ * the static "Contact Us" text on AboutUsScreen — this has a real lifecycle
+ * an admin manages and the filer can see resolve.
+ *
+ * Author identity (userId/authorName/accountType) is always resolved
+ * server-side from the session, mirroring `reviews` — never trusted from the
+ * request body, so a complaint can't be filed on someone else's behalf.
+ */
+export const complaints = pgTable('complaints', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull(),
+  authorName: text('author_name').notNull(),
+  accountType: text('account_type').$type<'Patient' | 'Doctor'>().notNull(),
+  category: text('category').$type<'billing' | 'appointment' | 'provider' | 'technical' | 'other'>().notNull(),
+  subject: text('subject').notNull(),
+  description: text('description').notNull(),
+  /** The visit this concerns, if any — not collected by the current submit form, but here for a future "Report a problem" button on a specific appointment. */
+  appointmentId: uuid('appointment_id').references(() => appointments.id),
+  status: text('status').$type<'pending' | 'resolved' | 'dismissed'>().notNull().default('pending'),
+  /** Admin's note, shown back to the filer once resolved/dismissed. */
+  resolutionNote: text('resolution_note'),
+  submittedAt: text('submitted_at').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  resolvedAt: timestamp('resolved_at', { withTimezone: true }),
 });
 
 /**
@@ -559,3 +613,4 @@ export type PlatformSettingsRow = typeof platformSettings.$inferSelect;
 export type EarningsLedgerRow = typeof earningsLedger.$inferSelect;
 export type PromoCodeRow = typeof promoCodes.$inferSelect;
 export type PromoRedemptionRow = typeof promoRedemptions.$inferSelect;
+export type ComplaintRow = typeof complaints.$inferSelect;

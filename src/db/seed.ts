@@ -35,6 +35,7 @@ async function seed() {
   await db.delete(s.medicalNotes);
   await db.delete(s.documents);
   await db.delete(s.rosterPatients);
+  await db.delete(s.complaints);
   await db.delete(s.promoRedemptions);
   await db.delete(s.payments);
   await db.delete(s.appointments);
@@ -78,11 +79,11 @@ async function seed() {
   const insertedDoctors = await db
     .insert(s.doctors)
     .values([
-      { userId: amaraUser.id, name: 'Dr. Amara Okafor MD', specialty: 'Therapist, Primary care doctor', category: 'Primary Care', rating: 4.9, reviews: 79, location: 'Victoria Island, Lagos', fee: '₦15,000', available: true, nextAvailable: '29, June' },
-      { userId: chineduUser.id, name: 'Dr. Chinedu Eze MD', specialty: 'Eye Specialist, Eye Doctor', category: 'Eye Doctor', rating: 4.9, reviews: 79, location: 'Ikeja, Lagos', fee: '₦22,000', available: true, nextAvailable: '29, June' },
-      { name: 'Dr. Funmilayo Adeyemi', specialty: 'OBGYN Specialist', category: 'OBGYN', rating: 4.7, reviews: 213, location: 'Garki, Abuja', fee: '₦28,000', available: false, nextAvailable: '2, July' },
-      { name: 'Dr. James Whitfield MD', specialty: 'Cardiologist, Internal Medicine', category: 'Cardiology', rating: 4.6, reviews: 87, location: 'London, UK · Remote', fee: '₦38,000', available: true, nextAvailable: '30, June' },
-      { name: 'Dr. Aisha Bello MD', specialty: 'Dermatologist', category: 'Dermatology', rating: 4.9, reviews: 301, location: 'Port Harcourt, Rivers', fee: '₦20,000', available: true, nextAvailable: '1, July' },
+      { userId: amaraUser.id, name: 'Dr. Amara Okafor MD', specialty: 'Therapist, Primary care doctor', category: 'Primary Care', rating: 4.9, reviews: 79, location: 'Victoria Island, Lagos', fee: '₦15,000', available: true, nextAvailable: '29, June', canProvideInHome: true, spokenLanguages: ['English', 'Igbo'] },
+      { userId: chineduUser.id, name: 'Dr. Chinedu Eze MD', specialty: 'Eye Specialist, Eye Doctor', category: 'Eye Doctor', rating: 4.9, reviews: 79, location: 'Ikeja, Lagos', fee: '₦22,000', available: true, nextAvailable: '29, June', spokenLanguages: ['English', 'Yoruba', 'Pidgin'] },
+      { name: 'Dr. Funmilayo Adeyemi', specialty: 'OBGYN Specialist', category: 'OBGYN', rating: 4.7, reviews: 213, location: 'Garki, Abuja', fee: '₦28,000', available: false, nextAvailable: '2, July', spokenLanguages: ['English', 'Yoruba'] },
+      { name: 'Dr. James Whitfield MD', specialty: 'Cardiologist, Internal Medicine', category: 'Cardiology', rating: 4.6, reviews: 87, location: 'London, UK · Remote', fee: '₦38,000', available: true, nextAvailable: '30, June', spokenLanguages: ['English'] },
+      { name: 'Dr. Aisha Bello MD', specialty: 'Dermatologist', category: 'Dermatology', rating: 4.9, reviews: 301, location: 'Port Harcourt, Rivers', fee: '₦20,000', available: true, nextAvailable: '1, July', canProvideInHome: true, spokenLanguages: ['English', 'Hausa', 'Pidgin'] },
     ])
     .returning();
   const docByName = Object.fromEntries(insertedDoctors.map((d) => [d.name, d] as const));
@@ -249,6 +250,32 @@ async function seed() {
     { author: 'Ada O.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 4, title: 'Really helpful', text: 'Solid consultation and genuinely helpful advice. Knocked a star off only because the app kept me waiting a couple of minutes past my slot.', verified: true, commentsCount: 4, submittedAt: 'Dec 30, 2025', status: 'published' },
     { author: 'Tunde A.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 4, title: 'Would book again', text: 'Professional and friendly. Answered my follow-up message the same day.', verified: true, commentsCount: 2, submittedAt: 'Dec 12, 2025', status: 'published' },
     { author: 'Ngozi E.', subject: 'Dr. Amara Okafor MD', direction: 'patient→provider', rating: 3, title: 'Decent but rushed', text: 'The advice was fine but the call felt a little rushed towards the end.', verified: false, commentsCount: 1, submittedAt: 'Nov 20, 2025', status: 'published' },
+  ]);
+
+  console.log('Seeding complaints…');
+  await db.insert(s.complaints).values([
+    {
+      userId: martin.id,
+      authorName: `${martin.firstName} ${martin.lastName}`,
+      accountType: 'Patient',
+      category: 'billing',
+      subject: 'Charged twice for the same visit',
+      description: 'I was charged twice on my card for my July 18 video visit with Dr. Okafor. Please refund the duplicate charge.',
+      submittedAt: 'Jul 19, 2026',
+      status: 'pending',
+    },
+    {
+      userId: martin.id,
+      authorName: `${martin.firstName} ${martin.lastName}`,
+      accountType: 'Patient',
+      category: 'technical',
+      subject: 'Video call kept freezing',
+      description: 'The video kept freezing every couple of minutes during my consultation and we had to finish over audio only.',
+      submittedAt: 'Jul 10, 2026',
+      status: 'resolved',
+      resolutionNote: 'Traced to a CDN region issue on our video provider\'s side, resolved as of Jul 12. Sorry for the disruption — let us know if it happens again.',
+      resolvedAt: new Date('2026-07-12T15:00:00Z'),
+    },
   ]);
 
   console.log('\nSeed complete. Demo logins (password: Password123!):');
