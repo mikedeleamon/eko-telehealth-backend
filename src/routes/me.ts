@@ -3,10 +3,12 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
 import {
+  appointments,
   dependents,
   documents,
   insuranceInfo,
   labs,
+  payments,
   pharmacyPreferences,
   prescriptions,
   userSettings,
@@ -379,6 +381,51 @@ router.patch(
       })
       .returning();
     res.json(toSettings(row!));
+  }),
+);
+
+// ── Payment history ─────────────────────────────────────────────────────────
+
+/**
+ * GET /me/payments — every settled payment this patient made, newest first.
+ *
+ * `amount`/`currency` are what was actually charged at the gateway (USD for
+ * PayPal, NGN for Flutterwave) — do not sum these across rows, they mix
+ * currencies. The breakdown fields (consultationFee/serviceCharge/vat/
+ * discount) are always canonical NGN regardless of gateway, so summable
+ * client-side for a "total spent" figure (same reasoning as
+ * routes/admin.ts's revenue stat).
+ */
+router.get(
+  '/payments',
+  asyncHandler(async (req, res) => {
+    const db = getDb();
+    const rows = await db
+      .select({ payment: payments, appt: appointments })
+      .from(payments)
+      .innerJoin(appointments, eq(payments.appointmentId, appointments.id))
+      .where(and(eq(appointments.patientId, req.user!.id), eq(payments.status, 'succeeded')))
+      .orderBy(desc(payments.createdAt));
+
+    res.json(
+      rows.map(({ payment, appt }) => ({
+        id: payment.id,
+        doctorName: appt.doctorName,
+        specialty: appt.specialty,
+        visitType: appt.type,
+        date: appt.date,
+        time: appt.time,
+        provider: payment.provider,
+        amount: payment.amount,
+        currency: payment.currency,
+        consultationFee: payment.consultationFee ?? undefined,
+        serviceCharge: payment.serviceCharge ?? undefined,
+        vat: payment.vat ?? undefined,
+        discount: payment.discount,
+        promoCode: payment.promoCode ?? undefined,
+        createdAt: payment.createdAt.toISOString(),
+      })),
+    );
   }),
 );
 

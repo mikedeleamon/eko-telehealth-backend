@@ -170,10 +170,126 @@ export const payments = pgTable('payments', {
   appointmentId: uuid('appointment_id').references(() => appointments.id),
   provider: text('provider').$type<'flutterwave' | 'paypal'>().notNull(),
   // doublePrecision (not integer) so PayPal amounts can carry cents (e.g. 9.38).
+  // What was actually charged at the gateway — patientTotal in NGN for
+  // Flutterwave, or its USD conversion for PayPal. See the breakdown columns
+  // below for the canonical-NGN fee split amount/currency is derived from.
   amount: doublePrecision('amount').notNull(),
   currency: text('currency').notNull().default('NGN'),
   checkoutRef: text('checkout_ref').notNull().default(''),
   status: text('status').$type<'pending' | 'succeeded' | 'failed'>().notNull().default('pending'),
+  /**
+   * Fee breakdown, in canonical NGN (see lib/pricing.ts computeFeeBreakdown),
+   * independent of amount/currency above. Nullable: rows created before the
+   * pricing engine (migrations/0003_pricing_and_earnings.sql) predate the
+   * split — that migration backfills them (amount as consultationFee,
+   * nothing withheld) instead of leaving them null.
+   */
+  consultationFee: doublePrecision('consultation_fee'),
+  serviceCharge: doublePrecision('service_charge'),
+  /**
+   * Patient-borne VAT, added to patientTotal on top of the fee — never
+   * withheld from the provider. Zero for Clinic Visit / Home Visit; only
+   * Video Visit is VAT-able. See lib/pricing.ts.
+   */
+  vat: doublePrecision('vat'),
+  /** Discount from a promo code (task 0.2). Only ever eats into the platform's own share — never VAT or provider payout. */
+  discount: doublePrecision('discount').notNull().default(0),
+  /** The promo code applied at checkout (uppercased), if any — see services/promos.ts. Null when discount is 0. */
+  promoCode: text('promo_code'),
+  providerCommission: doublePrecision('provider_commission'),
+  /** consultationFee − providerCommission. What routes/webhooks.ts credits to earnings_ledger. */
+  providerPayout: doublePrecision('provider_payout'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Admin-managed discount codes (task 0.2). `value` is a fraction (0.20) for
+ * kind:'percent' or a flat NGN amount for kind:'flat'. Redemption counts are
+ * NOT stored here — they're derived by counting promo_redemptions rows (the
+ * same "sum the ledger" pattern as earningsLedger), so a count can never
+ * drift from reality.
+ */
+export const promoCodes = pgTable('promo_codes', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  /** Stored uppercased; matched case-insensitively by uppercasing the input. */
+  code: text('code').notNull().unique(),
+  kind: text('kind').$type<'percent' | 'flat'>().notNull(),
+  value: doublePrecision('value').notNull(),
+  /** Minimum consultationFee + serviceCharge (pre-VAT) to qualify. */
+  minSpend: doublePrecision('min_spend').notNull().default(0),
+  /** Total redemptions allowed across all patients. Null = unlimited. */
+  maxRedemptions: integer('max_redemptions'),
+  /** Redemptions allowed per patient. */
+  perUserLimit: integer('per_user_limit').notNull().default(1),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+  active: boolean('active').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * One row per SETTLED redemption — never written for an abandoned checkout
+ * (see services/promos.ts recordPromoRedemption, called only from
+ * webhooks.ts once a payment has actually succeeded). This is what
+ * maxRedemptions/perUserLimit are checked against, so browsing with a code
+ * applied can never exhaust a limited code's supply.
+ */
+export const promoRedemptions = pgTable('promo_redemptions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  promoId: uuid('promo_id')
+    .references(() => promoCodes.id)
+    .notNull(),
+  userId: uuid('user_id')
+    .references(() => users.id)
+    .notNull(),
+  paymentId: uuid('payment_id')
+    .references(() => payments.id)
+    .notNull(),
+  discount: doublePrecision('discount').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Single-row table of the platform's fee-schedule rates (service charge /
+ * commission / VAT — see lib/pricing.ts). Admin-managed (GET/PATCH
+ * /admin/settings, task 0.1.f). Read via services/platformSettings.ts, which
+ * seeds this row with defaults on first read if it's ever found empty.
+ */
+export const platformSettings = pgTable('platform_settings', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  serviceChargePct: doublePrecision('service_charge_pct').notNull().default(0),
+  commissionPct: doublePrecision('commission_pct').notNull().default(0.175),
+  vatPct: doublePrecision('vat_pct').notNull().default(0.075),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * The doctor wallet: one row per earning (a visit's payout, credited when
+ * webhooks.ts confirms payment) or withdrawal (routes/practice.ts POST
+ * /payouts). GET /practice/earnings derives balance/pending/thisMonth from
+ * this table — see summarizeEarnings in routes/practice.ts, which mirrors
+ * the app's mock (mockApi.ts) so the client contract is unchanged.
+ *
+ * date/time are display strings (not derived from createdAt) so an earning
+ * row shows the visit's own date/time rather than the moment it settled —
+ * consistent with how appointments.date/time and doctors.fee are stored:
+ * display-ready strings alongside the real foreign keys (see the note at the
+ * top of this file).
+ */
+export const earningsLedger = pgTable('earnings_ledger', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  doctorId: uuid('doctor_id')
+    .references(() => doctors.id)
+    .notNull(),
+  kind: text('kind').$type<'earning' | 'withdrawal'>().notNull(),
+  /** Patient name for an earning, or a withdrawal label — mirrors EarningItem.title on the client. */
+  title: text('title').notNull(),
+  date: text('date').notNull(),
+  time: text('time').notNull(),
+  /** Positive NGN amount; `kind` decides the sign shown. */
+  amount: doublePrecision('amount').notNull(),
+  status: text('status').$type<'settled' | 'pending'>().notNull().default('settled'),
+  /** The visit this earning was credited for. Null for withdrawals. */
+  appointmentId: uuid('appointment_id').references(() => appointments.id),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -438,3 +554,8 @@ export type DocumentRow = typeof documents.$inferSelect;
 export type PrescriptionRow = typeof prescriptions.$inferSelect;
 export type LabRow = typeof labs.$inferSelect;
 export type MedicalNoteRow = typeof medicalNotes.$inferSelect;
+export type PaymentRow = typeof payments.$inferSelect;
+export type PlatformSettingsRow = typeof platformSettings.$inferSelect;
+export type EarningsLedgerRow = typeof earningsLedger.$inferSelect;
+export type PromoCodeRow = typeof promoCodes.$inferSelect;
+export type PromoRedemptionRow = typeof promoRedemptions.$inferSelect;

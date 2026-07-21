@@ -1,19 +1,81 @@
 import { Router } from 'express';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { configured, env } from '../config/env';
 import { getDb } from '../db/client';
-import { appointments, conversations, doctors, messages, payments } from '../db/schema';
+import { appointments, conversations, doctors, earningsLedger, messages, payments, users, type AppointmentRow, type PaymentRow } from '../db/schema';
 import { asyncHandler } from '../lib/http';
+import { parseAmount } from '../lib/format';
+import { computeFeeBreakdown } from '../lib/pricing';
+import { getPlatformSettings } from '../services/platformSettings';
 import { notify } from '../services/notify';
 import { capturePaypalOrder, verifyPaypalWebhook } from '../services/payments/paypal';
+import { recordPromoRedemption } from '../services/promos';
 import { verifyStreamWebhook } from '../services/stream';
 
 /**
- * A verified payment succeeded — confirm the visit and tell the patient.
+ * Credit the provider's wallet for a just-confirmed visit.
+ *
+ * Checkout (routes/payments.ts, task 0.1.d) is meant to compute and persist
+ * the fee breakdown on the payment row up front; this only recomputes it as
+ * a fallback for a payment that predates that wiring (providerPayout still
+ * null), so the split is guaranteed to exist by the time earnings are
+ * credited either way — and, once computed, is persisted back onto the
+ * payment row so it isn't recomputed on a future retry.
+ *
+ * Idempotent: skips if this appointment already has an 'earning' row (belt
+ * and suspenders — confirmPaidAppointment's own status guard already stops a
+ * duplicate webhook from reaching here a second time).
+ */
+async function creditDoctorEarning(appt: AppointmentRow, payment: PaymentRow): Promise<void> {
+  if (!appt.doctorId) return; // no linked doctor profile — nothing to credit
+
+  const db = getDb();
+  let providerPayout = payment.providerPayout;
+  if (providerPayout == null) {
+    const rates = await getPlatformSettings();
+    const breakdown = computeFeeBreakdown(payment.consultationFee ?? parseAmount(appt.fee), appt.type, rates);
+    await db
+      .update(payments)
+      .set({
+        consultationFee: breakdown.consultationFee,
+        serviceCharge: breakdown.serviceCharge,
+        vat: breakdown.vat,
+        providerCommission: breakdown.providerCommission,
+        providerPayout: breakdown.providerPayout,
+      })
+      .where(eq(payments.id, payment.id));
+    providerPayout = breakdown.providerPayout;
+  }
+
+  const [already] = await db
+    .select()
+    .from(earningsLedger)
+    .where(and(eq(earningsLedger.appointmentId, appt.id), eq(earningsLedger.kind, 'earning')));
+  if (already) return;
+
+  const [patient] = await db.select().from(users).where(eq(users.id, appt.patientId));
+  await db.insert(earningsLedger).values({
+    doctorId: appt.doctorId,
+    kind: 'earning',
+    title: patient ? `${patient.firstName} ${patient.lastName}` : 'Patient',
+    date: appt.date,
+    time: appt.time,
+    amount: providerPayout,
+    status: 'settled',
+    appointmentId: appt.id,
+  });
+}
+
+/**
+ * A verified payment succeeded — confirm the visit, tell the patient, credit
+ * the provider's wallet, and count the promo redemption (if any).
  *
  * This is the ONLY place an appointment becomes 'upcoming'. Guarded on
  * 'pending_payment' so a late or duplicate webhook can't resurrect a visit the
- * patient cancelled (or re-confirm one already confirmed) after the fact.
+ * patient cancelled (or re-confirm one already confirmed) after the fact —
+ * that same guard is what keeps creditDoctorEarning and the redemption below
+ * from double-firing on a webhook retry, since a retry finds the appointment
+ * already 'upcoming' and returns before reaching them.
  */
 async function confirmPaidAppointment(appointmentId: string): Promise<void> {
   const db = getDb();
@@ -37,6 +99,23 @@ async function confirmPaidAppointment(appointmentId: string): Promise<void> {
     if (doc?.userId) {
       await notify(doc.userId, 'Visit Confirmed', `The ${appt.date} ${appt.time} visit is paid and confirmed.`);
     }
+  }
+
+  // Fetched once and shared: crediting the provider and counting a promo
+  // redemption both key off this same settled payment row.
+  const [payment] = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.appointmentId, appt.id))
+    .orderBy(desc(payments.createdAt))
+    .limit(1);
+  if (!payment) return; // shouldn't happen — a webhook just confirmed a payment that must exist
+
+  await creditDoctorEarning(appt, payment);
+  // Only counted here, on a settled payment — never at checkout/preview time
+  // — so an abandoned checkout can never burn a limited code's supply.
+  if (payment.promoCode && payment.discount > 0) {
+    await recordPromoRedemption(payment.id, payment.promoCode, appt.patientId, payment.discount);
   }
 }
 

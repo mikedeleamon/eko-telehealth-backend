@@ -2,11 +2,28 @@ import { Router } from 'express';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { agendaItems, appointments, doctors, labs, medicalNotes, prescriptions, rosterPatients, users, type LabRow, type MedicalNoteRow, type NoteAmendment, type PrescriptionRow } from '../db/schema';
+import {
+  agendaItems,
+  appointments,
+  doctors,
+  earningsLedger,
+  labs,
+  medicalNotes,
+  payments,
+  prescriptions,
+  rosterPatients,
+  users,
+  type EarningsLedgerRow,
+  type LabRow,
+  type MedicalNoteRow,
+  type NoteAmendment,
+  type PrescriptionRow,
+} from '../db/schema';
 import { randomUUID } from 'node:crypto';
 import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
+import { formatClockTime, formatJoined, formatNaira } from '../lib/format';
 import { requireAuth, requireAccountType } from '../middleware/auth';
 import { notify } from '../services/notify';
 import { toAppointment } from './appointments';
@@ -176,6 +193,38 @@ router.post(
       `${existing.doctorName} accepted your ${existing.date} ${existing.time} request. Pay ${existing.fee ?? 'the fee'} to confirm it.`,
     );
     res.json(toAppointment(row!));
+  }),
+);
+
+/**
+ * GET /practice/appointments/:id/breakdown — a doctor's take-home detail for
+ * a paid visit (what AppointmentDetailsScreen shows instead of the raw fee).
+ * 404s until a payment has actually settled — there's nothing to break down
+ * before that, and the breakdown belongs to the settled payment, not the
+ * appointment's display fee.
+ */
+router.get(
+  '/appointments/:id/breakdown',
+  asyncHandler(async (req, res) => {
+    const existing = await ownedAppointment(req.user!.id, param(req, 'id'));
+    const db = getDb();
+    const [payment] = await db
+      .select()
+      .from(payments)
+      .where(and(eq(payments.appointmentId, existing.id), eq(payments.status, 'succeeded')))
+      .orderBy(desc(payments.createdAt))
+      .limit(1);
+    if (!payment || payment.consultationFee == null) {
+      throw new HttpError(404, 'No settled payment for this appointment yet.');
+    }
+    res.json({
+      consultationFee: payment.consultationFee,
+      serviceCharge: payment.serviceCharge ?? 0,
+      vat: payment.vat ?? 0,
+      discount: payment.discount,
+      providerCommission: payment.providerCommission ?? 0,
+      providerPayout: payment.providerPayout ?? 0,
+    });
   }),
 );
 
@@ -570,6 +619,98 @@ router.post(
         : `${existing.doctorName} could not take your ${existing.date} ${existing.time} request.`,
     );
     res.json(toAppointment(row!));
+  }),
+);
+
+// ── Earnings & payouts ──────────────────────────────────────────────────────
+
+/** Minimum a doctor can withdraw at once — mirrors the app's mock (CashOutScreen). */
+const MIN_CASHOUT = 1000;
+
+function toEarningItem(r: EarningsLedgerRow) {
+  return { id: r.id, kind: r.kind, title: r.title, date: r.date, time: r.time, amount: r.amount, status: r.status };
+}
+
+/**
+ * Derive wallet totals from the ledger. Mirrors the app's mock
+ * (summarizeEarnings in mockApi.ts) with one deliberate difference:
+ * `thisMonth` is filtered to the current calendar month here, honoring the
+ * DoctorEarnings.thisMonth contract ("Total earned in the current calendar
+ * month") — the mock's version sums every settled earning regardless of
+ * date, a demo-data shortcut that happens to hold because the seed data is
+ * always recent.
+ */
+function summarizeEarnings(rows: EarningsLedgerRow[]) {
+  const now = new Date();
+  let balance = 0;
+  let pending = 0;
+  let thisMonth = 0;
+  for (const item of rows) {
+    if (item.kind === 'earning') {
+      if (item.status === 'settled') {
+        balance += item.amount;
+        if (item.createdAt.getFullYear() === now.getFullYear() && item.createdAt.getMonth() === now.getMonth()) {
+          thisMonth += item.amount;
+        }
+      }
+    } else {
+      balance -= item.amount;
+      if (item.status === 'pending') pending += item.amount;
+    }
+  }
+  return { balance, thisMonth, pending, currency: 'NGN', items: rows.map(toEarningItem) };
+}
+
+/** GET /practice/earnings — the doctor's wallet: balance + earnings ledger. */
+router.get(
+  '/earnings',
+  asyncHandler(async (req, res) => {
+    const docId = await doctorIdFor(req.user!.id);
+    if (!docId) throw new HttpError(403, 'No doctor profile is linked to this account yet.');
+    const db = getDb();
+    const rows = await db.select().from(earningsLedger).where(eq(earningsLedger.doctorId, docId)).orderBy(desc(earningsLedger.createdAt));
+    res.json(summarizeEarnings(rows));
+  }),
+);
+
+/**
+ * POST /practice/payouts — withdraw `amount` from the wallet balance.
+ *
+ * The destination is meant to be the doctor's saved payment method, resolved
+ * server-side (never sent by the client) — /me/payment-method isn't wired to
+ * this yet, so the withdrawal is simply recorded 'pending', as if queued for
+ * an operator/payment-rail to settle, matching the mock's cash-out behavior.
+ */
+router.post(
+  '/payouts',
+  asyncHandler(async (req, res) => {
+    const { amount } = z.object({ amount: z.number().positive() }).parse(req.body);
+    const docId = await doctorIdFor(req.user!.id);
+    if (!docId) throw new HttpError(403, 'No doctor profile is linked to this account yet.');
+    if (amount < MIN_CASHOUT) throw new HttpError(400, `Minimum withdrawal is ${formatNaira(MIN_CASHOUT)}.`);
+
+    const db = getDb();
+    const rows = await db.select().from(earningsLedger).where(eq(earningsLedger.doctorId, docId));
+    const { balance } = summarizeEarnings(rows);
+    if (amount > balance) throw new HttpError(409, 'Withdrawal exceeds available balance.');
+
+    const now = new Date();
+    await db.insert(earningsLedger).values({
+      doctorId: docId,
+      kind: 'withdrawal',
+      title: 'Withdrawal',
+      date: formatJoined(now),
+      time: formatClockTime(now),
+      amount,
+      status: 'pending',
+    });
+
+    const updated = await db
+      .select()
+      .from(earningsLedger)
+      .where(eq(earningsLedger.doctorId, docId))
+      .orderBy(desc(earningsLedger.createdAt));
+    res.status(201).json(summarizeEarnings(updated));
   }),
 );
 

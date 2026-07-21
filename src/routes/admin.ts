@@ -1,13 +1,14 @@
 import { Router } from 'express';
-import { and, count, desc, eq, gte, inArray, sum } from 'drizzle-orm';
+import { count, desc, eq, gte, inArray, sum } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { appointments, doctors, payments, providerApplications, reviews, users } from '../db/schema';
+import { appointments, doctors, payments, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatJoined, formatNaira } from '../lib/format';
 import { requireAuth, requireAccountType } from '../middleware/auth';
 import { notify } from '../services/notify';
+import { getPlatformSettings } from '../services/platformSettings';
 
 const router = Router();
 // NOTE: the admin site still needs a login screen (integration guide, Step 5).
@@ -22,26 +23,165 @@ router.get(
     const db = getDb();
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-    const [[patients], [providers], [weekAppts], [revenue], [pendingVer], [pendingRev]] = await Promise.all([
+    const [[patients], [providers], [weekAppts], [revenueAgg], [pendingVer], [pendingRev]] = await Promise.all([
       db.select({ value: count() }).from(users).where(eq(users.accountType, 'Patient')),
       db.select({ value: count() }).from(doctors),
       db.select({ value: count() }).from(appointments).where(gte(appointments.createdAt, weekAgo)),
+      // Sum the canonical-NGN breakdown columns (lib/pricing.ts), not `amount`
+      // — amount is what was charged at the gateway, which is USD (not NGN)
+      // for PayPal, so summing it directly would mix currencies. The
+      // breakdown is always NGN regardless of gateway, so no currency filter
+      // is needed here (the old query silently dropped every PayPal payment).
       db
-        .select({ value: sum(payments.amount) })
+        .select({
+          serviceCharge: sum(payments.serviceCharge),
+          commission: sum(payments.providerCommission),
+          discount: sum(payments.discount),
+          vat: sum(payments.vat),
+        })
         .from(payments)
-        .where(and(eq(payments.status, 'succeeded'), eq(payments.currency, 'NGN'))),
+        .where(eq(payments.status, 'succeeded')),
       db.select({ value: count() }).from(providerApplications).where(eq(providerApplications.status, 'pending')),
       db.select({ value: count() }).from(reviews).where(eq(reviews.status, 'pending')),
     ]);
+
+    // Platform revenue = service charge + provider commission − discount.
+    // VAT is deliberately excluded: it's patient-borne and collected on the
+    // platform's behalf, but it's a liability owed to tax authorities, not
+    // platform income — reported separately as vatCollected.
+    const platformRevenue =
+      Number(revenueAgg?.serviceCharge ?? 0) + Number(revenueAgg?.commission ?? 0) - Number(revenueAgg?.discount ?? 0);
+    const vatCollected = Number(revenueAgg?.vat ?? 0);
 
     res.json({
       totalPatients: patients?.value ?? 0,
       activeProviders: providers?.value ?? 0,
       appointmentsThisWeek: weekAppts?.value ?? 0,
-      revenueThisMonth: formatNaira(Number(revenue?.value ?? 0)),
+      revenueThisMonth: formatNaira(platformRevenue),
+      vatCollected: formatNaira(vatCollected),
       pendingVerifications: pendingVer?.value ?? 0,
       pendingReviews: pendingRev?.value ?? 0,
     });
+  }),
+);
+
+/** GET /admin/settings — the platform's fee-schedule rates. */
+router.get(
+  '/settings',
+  asyncHandler(async (_req, res) => {
+    res.json(await getPlatformSettings());
+  }),
+);
+
+const settingsSchema = z.object({
+  serviceChargePct: z.number().min(0).max(1),
+  commissionPct: z.number().min(0).max(1),
+  vatPct: z.number().min(0).max(1),
+});
+
+/**
+ * PATCH /admin/settings — update the fee-schedule rates.
+ *
+ * All three fields are required (not a partial patch) so a save always
+ * reflects a complete, intentional rate schedule rather than a half-updated
+ * one. Rates apply going forward only — payments already checked out keep
+ * the breakdown persisted on them at intent time (routes/payments.ts).
+ */
+router.patch(
+  '/settings',
+  asyncHandler(async (req, res) => {
+    const rates = settingsSchema.parse(req.body);
+    await getPlatformSettings(); // ensures the single row exists
+    const db = getDb();
+    const [row] = await db.select().from(platformSettings).limit(1);
+    const [updated] = await db
+      .update(platformSettings)
+      .set({ ...rates, updatedAt: new Date() })
+      .where(eq(platformSettings.id, row!.id))
+      .returning();
+    res.json({ serviceChargePct: updated!.serviceChargePct, commissionPct: updated!.commissionPct, vatPct: updated!.vatPct });
+  }),
+);
+
+/** GET /admin/promos — all promo codes, with live (settled-only) redemption counts. */
+router.get(
+  '/promos',
+  asyncHandler(async (_req, res) => {
+    const db = getDb();
+    const [rows, counts] = await Promise.all([
+      db.select().from(promoCodes).orderBy(desc(promoCodes.createdAt)),
+      db.select({ promoId: promoRedemptions.promoId, value: count() }).from(promoRedemptions).groupBy(promoRedemptions.promoId),
+    ]);
+    const countByPromo = new Map(counts.map((c) => [c.promoId, Number(c.value)]));
+    res.json(
+      rows.map((p) => ({
+        id: p.id,
+        code: p.code,
+        kind: p.kind,
+        value: p.value,
+        minSpend: p.minSpend,
+        maxRedemptions: p.maxRedemptions,
+        perUserLimit: p.perUserLimit,
+        expiresAt: p.expiresAt ? p.expiresAt.toISOString() : null,
+        active: p.active,
+        redemptions: countByPromo.get(p.id) ?? 0,
+      })),
+    );
+  }),
+);
+
+const promoInputSchema = z.object({
+  code: z.string().trim().min(2).max(32),
+  kind: z.enum(['percent', 'flat']),
+  value: z.number().positive(),
+  minSpend: z.number().min(0).default(0),
+  maxRedemptions: z.number().int().positive().nullable().optional(),
+  perUserLimit: z.number().int().positive().default(1),
+  expiresAt: z.string().datetime().nullable().optional(),
+  active: z.boolean().default(true),
+});
+
+/** POST /admin/promos — create a new code. */
+router.post(
+  '/promos',
+  asyncHandler(async (req, res) => {
+    const input = promoInputSchema.parse(req.body);
+    const db = getDb();
+    const [row] = await db
+      .insert(promoCodes)
+      .values({
+        code: input.code.toUpperCase(),
+        kind: input.kind,
+        value: input.value,
+        minSpend: input.minSpend,
+        maxRedemptions: input.maxRedemptions ?? null,
+        perUserLimit: input.perUserLimit,
+        expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+        active: input.active,
+      })
+      .returning();
+    res.status(201).json(row);
+  }),
+);
+
+/**
+ * PATCH /admin/promos/:id — edit a code. The usual edit here is deactivating
+ * one rather than deleting it — a hard delete would orphan its
+ * promo_redemptions history, which is the source of truth for its counts.
+ */
+router.patch(
+  '/promos/:id',
+  asyncHandler(async (req, res) => {
+    const input = promoInputSchema.partial().parse(req.body);
+    const { code, expiresAt, ...rest } = input;
+    const patch: Partial<typeof promoCodes.$inferInsert> = { ...rest };
+    if (code !== undefined) patch.code = code.toUpperCase();
+    if (expiresAt !== undefined) patch.expiresAt = expiresAt ? new Date(expiresAt) : null;
+
+    const db = getDb();
+    const [row] = await db.update(promoCodes).set(patch).where(eq(promoCodes.id, param(req, 'id'))).returning();
+    if (!row) throw new HttpError(404, 'Promo code not found');
+    res.json(row);
   }),
 );
 

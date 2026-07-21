@@ -29,11 +29,13 @@ async function seed() {
   await db.delete(s.messages);
   await db.delete(s.notifications);
   await db.delete(s.agendaItems);
+  await db.delete(s.earningsLedger);
   await db.delete(s.prescriptions);
   await db.delete(s.labs);
   await db.delete(s.medicalNotes);
   await db.delete(s.documents);
   await db.delete(s.rosterPatients);
+  await db.delete(s.promoRedemptions);
   await db.delete(s.payments);
   await db.delete(s.appointments);
   await db.delete(s.conversations);
@@ -45,6 +47,8 @@ async function seed() {
   await db.delete(s.insuranceInfo);
   await db.delete(s.pharmacyPreferences);
   await db.delete(s.userSettings);
+  await db.delete(s.platformSettings);
+  await db.delete(s.promoCodes);
   await db.delete(s.doctors);
   await db.delete(s.users);
 
@@ -204,6 +208,26 @@ async function seed() {
       plan: 'Add empagliflozin 10 mg daily. Dietitian referral. Repeat HbA1c in 3 months.',
       status: 'final',
     },
+  ]);
+
+  console.log('Seeding platform settings + doctor earnings…');
+  await db.insert(s.platformSettings).values({ serviceChargePct: 0, commissionPct: 0.175, vatPct: 0.075 });
+  // Amara's fee is ₦15,000; at the default 17.5% commission that's a ₦12,375
+  // payout per visit — VAT is patient-borne (added on top, task 0.1.d) so,
+  // unlike the old client-side split, it's never withheld here.
+  await db.insert(s.earningsLedger).values([
+    { doctorId: amara.id, kind: 'earning', title: 'Emeka Obi', date: 'Jul 18, 2026', time: '10:00 AM', amount: 12375, status: 'settled' },
+    { doctorId: amara.id, kind: 'earning', title: 'Alex Stewart', date: 'Jul 17, 2026', time: '2:30 PM', amount: 12375, status: 'settled' },
+    { doctorId: amara.id, kind: 'withdrawal', title: 'Withdrawal', date: 'Jul 16, 2026', time: '9:15 AM', amount: 25000, status: 'settled' },
+    { doctorId: amara.id, kind: 'earning', title: 'Ngozi Nwosu', date: 'Jul 15, 2026', time: '11:00 AM', amount: 12375, status: 'settled' },
+    { doctorId: amara.id, kind: 'earning', title: 'Augustine Watts', date: 'Jul 12, 2026', time: '3:00 PM', amount: 12375, status: 'settled' },
+    { doctorId: amara.id, kind: 'earning', title: 'Emeka Obi', date: 'Jul 8, 2026', time: '10:30 AM', amount: 12375, status: 'settled' },
+  ]);
+
+  console.log('Seeding promo codes…');
+  await db.insert(s.promoCodes).values([
+    { code: 'SAVE20', kind: 'percent', value: 0.2, minSpend: 0, maxRedemptions: null, perUserLimit: 1, active: true },
+    { code: 'WELCOME2000', kind: 'flat', value: 2000, minSpend: 10000, maxRedemptions: 50, perUserLimit: 1, active: true },
   ]);
 
   console.log('Seeding admin queues…');
