@@ -50,6 +50,8 @@ async function seed() {
   await db.delete(s.userSettings);
   await db.delete(s.platformSettings);
   await db.delete(s.promoCodes);
+  await db.delete(s.currencies);
+  await db.delete(s.contentBlocks);
   await db.delete(s.doctors);
   await db.delete(s.users);
 
@@ -208,6 +210,38 @@ async function seed() {
       secondaryDiagnoses: [],
       plan: 'Add empagliflozin 10 mg daily. Dietitian referral. Repeat HbA1c in 3 months.',
       status: 'final',
+    },
+  ]);
+
+  console.log('Seeding currencies…');
+  await db.insert(s.currencies).values([
+    { code: 'NGN', symbol: '₦', ngnRate: 1, active: true },
+    { code: 'USD', symbol: '$', ngnRate: 1600, active: true },
+    { code: 'GBP', symbol: '£', ngnRate: 2000, active: true },
+    { code: 'EUR', symbol: '€', ngnRate: 1750, active: true },
+  ]);
+
+  console.log('Seeding content blocks…');
+  await db.insert(s.contentBlocks).values([
+    {
+      key: 'about_mission',
+      title: 'Our Mission',
+      body: 'Eko Telehealth connects patients with licensed, verified doctors for video, clinic, and home visits — bringing quality healthcare within reach, wherever you are.',
+    },
+    {
+      key: 'about_contact',
+      title: 'Contact Us',
+      body: 'Have a question or need help? Reach our support team at support@ekotelehealth.com, or use "Report a Problem" in Settings to file a trackable request.',
+    },
+    {
+      key: 'terms_of_service',
+      title: 'Terms of Service',
+      body: 'By using Eko Telehealth, you agree to receive care from licensed providers subject to their own professional obligations, to provide accurate information during registration and consultations, and to use the platform only for its intended purpose of arranging and conducting telehealth visits. Eko Telehealth is a marketplace connecting patients and providers; it does not itself practice medicine. Full terms are available on request from support@ekotelehealth.com.',
+    },
+    {
+      key: 'privacy_policy',
+      title: 'Privacy Policy',
+      body: 'Eko Telehealth collects the information needed to provide care: your account details, appointment history, and any medical information you or your provider add to your record. This information is shared only with providers you consult and is never sold. You can request a copy or deletion of your data at any time via support@ekotelehealth.com.',
     },
   ]);
 

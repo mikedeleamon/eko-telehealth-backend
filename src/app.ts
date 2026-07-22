@@ -8,7 +8,9 @@ import authRoutes from './routes/auth';
 import callRoutes from './routes/calls';
 import chatRoutes from './routes/chat';
 import complaintRoutes from './routes/complaints';
+import contentRoutes from './routes/content';
 import conversationRoutes from './routes/conversations';
+import currencyRoutes from './routes/currencies';
 import doctorRoutes from './routes/doctors';
 import meRoutes from './routes/me';
 import notificationRoutes from './routes/notifications';
@@ -68,6 +70,8 @@ export function createApp() {
   app.use('/providers', providerRoutes);
   app.use('/reviews', reviewRoutes);
   app.use('/complaints', complaintRoutes);
+  app.use('/currencies', currencyRoutes);
+  app.use('/content', contentRoutes);
   app.use('/uploads', uploadRoutes);
 
   // Provider callbacks + admin console

@@ -5,7 +5,9 @@ import { getDb } from '../db/client';
 import { appointments, dependents, doctors, type AppointmentRow } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
+import { formatLagosClockTime, formatLagosDate } from '../lib/timezone';
 import { requireAuth } from '../middleware/auth';
+import { isSlotAvailable } from '../services/availability';
 import { notify } from '../services/notify';
 
 const router = Router();
@@ -19,6 +21,7 @@ export function toAppointment(a: AppointmentRow) {
     specialty: a.specialty,
     date: a.date,
     time: a.time,
+    startAt: a.startAt?.toISOString(),
     type: a.type,
     status: a.status,
     fee: a.fee ?? undefined,
@@ -53,13 +56,16 @@ router.post(
     const input = z
       .object({
         doctorId: z.string().uuid(),
-        date: z.string().min(1),
-        time: z.string().min(1),
+        /** ISO instant — a slot returned by GET /doctors/:id/availability, re-validated below. */
+        startAt: z.string().min(1),
         type: z.enum(['Video Visit', 'Clinic Visit', 'Home Visit']),
         reason: z.string().optional(),
         dependentId: z.string().uuid().optional(),
       })
       .parse(req.body);
+
+    const startAt = new Date(input.startAt);
+    if (Number.isNaN(startAt.getTime())) throw new HttpError(400, 'Invalid start time.');
 
     const db = getDb();
     const [doctor] = await db.select().from(doctors).where(eq(doctors.id, input.doctorId));
@@ -80,37 +86,88 @@ router.post(
       if (!dep) throw new HttpError(404, 'Dependent not found');
     }
 
-    const [row] = await db
-      .insert(appointments)
-      .values({
-        patientId: req.user!.id,
-        doctorId: doctor.id,
-        doctorName: doctor.name,
-        specialty: doctor.category,
-        date: input.date,
-        time: input.time,
-        type: input.type,
-        reason: input.reason,
-        dependentId: input.dependentId,
-        fee: doctor.fee,
-        status: 'pending_approval',
-      })
-      .returning();
+    // Re-validated server-side against the doctor's real availability — a
+    // hand-crafted request must not be able to book a time that was never a
+    // real generated slot (e.g. misaligned minutes, or one already taken).
+    if (!(await isSlotAvailable(doctor.id, startAt))) {
+      throw new HttpError(409, 'This time is no longer available. Please pick another slot.');
+    }
+
+    const date = formatLagosDate(startAt);
+    const time = formatLagosClockTime(startAt);
+
+    let row: AppointmentRow;
+    try {
+      [row] = await db
+        .insert(appointments)
+        .values({
+          patientId: req.user!.id,
+          doctorId: doctor.id,
+          doctorName: doctor.name,
+          specialty: doctor.category,
+          date,
+          time,
+          startAt,
+          type: input.type,
+          reason: input.reason,
+          dependentId: input.dependentId,
+          fee: doctor.fee,
+          status: 'pending_approval',
+        })
+        .returning();
+    } catch (err) {
+      // The partial unique index (migrations/0013) is the race-condition
+      // backstop for two requests landing on the same slot in the same
+      // instant — isSlotAvailable() above already caught the common case.
+      if ((err as { code?: string }).code === '23505') {
+        throw new HttpError(409, 'This slot was just booked — pick another.');
+      }
+      throw err;
+    }
 
     await notify(
       req.user!.id,
       'Request Sent',
-      `Your ${input.type.toLowerCase()} request to ${doctor.name} for ${input.date} at ${input.time} is awaiting approval.`,
+      `Your ${input.type.toLowerCase()} request to ${doctor.name} for ${date} at ${time} is awaiting approval.`,
     );
     if (doctor.userId) {
       await notify(
         doctor.userId,
         'New Appointment Request',
-        `A patient requested a ${input.type.toLowerCase()} on ${input.date} at ${input.time}.`,
+        `A patient requested a ${input.type.toLowerCase()} on ${date} at ${time}.`,
       );
     }
 
     res.status(201).json(toAppointment(row!));
+  }),
+);
+
+/**
+ * POST /appointments/:id/check-in — patient marks themselves present/ready
+ * ahead of the visit (E-Check-In). Only from 'upcoming' — a request that
+ * hasn't been paid for/confirmed yet, or a visit that's already over, can't
+ * be checked into.
+ */
+router.post(
+  '/:id/check-in',
+  asyncHandler(async (req, res) => {
+    const db = getDb();
+    const [existing] = await db
+      .select()
+      .from(appointments)
+      .where(and(eq(appointments.id, param(req, 'id')), eq(appointments.patientId, req.user!.id)));
+    if (!existing) throw new HttpError(404, 'Appointment not found');
+    if (existing.status !== 'upcoming') {
+      throw new HttpError(409, `This appointment can't be checked into right now (it is ${existing.status}).`);
+    }
+
+    const [row] = await db
+      .update(appointments)
+      .set({ status: 'checked_in' })
+      .where(eq(appointments.id, existing.id))
+      .returning();
+
+    res.json(toAppointment(row!));
   }),
 );
 

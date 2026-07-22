@@ -5,7 +5,7 @@ import { getDb } from '../db/client';
 import { pendingSignups, users, verificationCodes, type UserRow } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler } from '../lib/http';
-import { signSession } from '../lib/jwt';
+import { signLoginChallenge, signSession, verifyLoginChallenge } from '../lib/jwt';
 import { hashPassword, verifyPassword } from '../lib/password';
 import { requireAuth } from '../middleware/auth';
 import { sendEmail } from '../services/email';
@@ -41,6 +41,8 @@ function sessionResponse(user: UserRow) {
       email: user.email,
       accountType: user.accountType,
       spokenLanguages: user.spokenLanguages,
+      preferredCurrency: user.preferredCurrency,
+      twoFactorEnabled: user.twoFactorEnabled,
     },
     accessToken,
     refreshToken,
@@ -68,6 +70,46 @@ router.post(
     if (accountType && user.accountType !== accountType && user.accountType !== 'Admin') {
       throw new HttpError(403, `This account is not registered as a ${accountType}.`);
     }
+
+    if (user.twoFactorEnabled) {
+      await issueCode(user.email, 'email');
+      res.json({ twoFactorRequired: true, challenge: signLoginChallenge(user.id) });
+      return;
+    }
+
+    res.json(sessionResponse(user));
+  }),
+);
+
+/**
+ * POST /auth/login/verify-2fa — the second step when /auth/login returned
+ * twoFactorRequired. The challenge proves the password was already checked,
+ * so this only needs the emailed code to complete the session.
+ */
+router.post(
+  '/login/verify-2fa',
+  asyncHandler(async (req, res) => {
+    const { challenge, code } = z.object({ challenge: z.string().min(1), code: z.string().min(4) }).parse(req.body);
+
+    let userId: string;
+    try {
+      userId = verifyLoginChallenge(challenge).sub;
+    } catch {
+      throw new HttpError(401, 'This code has expired. Please sign in again.');
+    }
+
+    const db = getDb();
+    const [user] = await db.select().from(users).where(eq(users.id, userId));
+    if (!user) throw new HttpError(401, 'This code has expired. Please sign in again.');
+    if (user.status === 'suspended') throw new HttpError(403, 'This account has been suspended.');
+
+    const dest = user.email.toLowerCase();
+    await checkCode(dest, 'email', code);
+    // checkCode() deliberately leaves a matched code alive for /auth/verify
+    // (password reset re-checks the same code later) — login has no such
+    // follow-up, so burn it here or it stays replayable for the rest of its
+    // window.
+    await db.delete(verificationCodes).where(eq(verificationCodes.destination, dest));
     res.json(sessionResponse(user));
   }),
 );
@@ -359,11 +401,24 @@ router.patch(
         // from the app's own display language (i18n). An empty array clears
         // it, so this is checked against `undefined`, not truthiness.
         spokenLanguages: z.array(z.string()).optional(),
+        // Display currency (task 2.4) — never changes what's actually
+        // charged, only what fees are shown converted to while browsing.
+        preferredCurrency: z.string().optional(),
+        // Login 2FA opt-in — the code always goes to this account's already-
+        // verified email, so toggling it on needs no extra proof step.
+        twoFactorEnabled: z.boolean().optional(),
       })
       .parse(req.body);
 
     const db = getDb();
-    const updates: Partial<{ firstName: string; lastName: string; phone: string; spokenLanguages: string[] }> = {};
+    const updates: Partial<{
+      firstName: string;
+      lastName: string;
+      phone: string;
+      spokenLanguages: string[];
+      preferredCurrency: string;
+      twoFactorEnabled: boolean;
+    }> = {};
     if (input.firstName) updates.firstName = input.firstName;
     if (input.lastName) updates.lastName = input.lastName;
     if (input.phone) {
@@ -375,6 +430,8 @@ router.patch(
       updates.phone = phone;
     }
     if (input.spokenLanguages !== undefined) updates.spokenLanguages = input.spokenLanguages;
+    if (input.preferredCurrency) updates.preferredCurrency = input.preferredCurrency;
+    if (input.twoFactorEnabled !== undefined) updates.twoFactorEnabled = input.twoFactorEnabled;
     if (!Object.keys(updates).length) throw new HttpError(400, 'Nothing to update.');
 
     const [user] = await db.update(users).set(updates).where(eq(users.id, req.user!.id)).returning();
@@ -386,6 +443,8 @@ router.patch(
       email: user.email,
       accountType: user.accountType,
       spokenLanguages: user.spokenLanguages,
+      preferredCurrency: user.preferredCurrency,
+      twoFactorEnabled: user.twoFactorEnabled,
     });
   }),
 );

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { count, desc, eq, gte, inArray, sum } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { appointments, complaints, doctors, payments, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
+import { appointments, complaints, contentBlocks, currencies, doctors, payments, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatJoined, formatNaira } from '../lib/format';
@@ -184,6 +184,89 @@ router.patch(
     const [row] = await db.update(promoCodes).set(patch).where(eq(promoCodes.id, param(req, 'id'))).returning();
     if (!row) throw new HttpError(404, 'Promo code not found');
     res.json(row);
+  }),
+);
+
+/** GET /admin/currencies — every display currency, including inactive ones. */
+router.get(
+  '/currencies',
+  asyncHandler(async (_req, res) => {
+    const db = getDb();
+    const rows = await db.select().from(currencies).orderBy(desc(currencies.createdAt));
+    res.json(rows);
+  }),
+);
+
+const currencyInputSchema = z.object({
+  code: z.string().trim().min(2).max(6),
+  symbol: z.string().trim().min(1).max(4),
+  ngnRate: z.number().positive(),
+  active: z.boolean().default(true),
+});
+
+/** POST /admin/currencies — add a display currency. */
+router.post(
+  '/currencies',
+  asyncHandler(async (req, res) => {
+    const input = currencyInputSchema.parse(req.body);
+    const db = getDb();
+    const [row] = await db
+      .insert(currencies)
+      .values({ code: input.code.toUpperCase(), symbol: input.symbol, ngnRate: input.ngnRate, active: input.active })
+      .returning();
+    res.status(201).json(row);
+  }),
+);
+
+/**
+ * PATCH /admin/currencies/:id — edit a rate or toggle active. This only
+ * affects display conversion (browsing/preview) — never what's actually
+ * charged, so editing a rate mid-checkout can't shift a patient's total.
+ */
+router.patch(
+  '/currencies/:id',
+  asyncHandler(async (req, res) => {
+    const input = currencyInputSchema.partial().parse(req.body);
+    const { code, ...rest } = input;
+    const patch: Partial<typeof currencies.$inferInsert> = { ...rest };
+    if (code !== undefined) patch.code = code.toUpperCase();
+
+    const db = getDb();
+    const [row] = await db.update(currencies).set(patch).where(eq(currencies.id, param(req, 'id'))).returning();
+    if (!row) throw new HttpError(404, 'Currency not found');
+    res.json(row);
+  }),
+);
+
+/** GET /admin/content — every content block, for the editor list. */
+router.get(
+  '/content',
+  asyncHandler(async (_req, res) => {
+    const db = getDb();
+    const rows = await db.select().from(contentBlocks).orderBy(contentBlocks.key);
+    res.json(rows.map((c) => ({ key: c.key, title: c.title, body: c.body, updatedAt: c.updatedAt.toISOString() })));
+  }),
+);
+
+/**
+ * PATCH /admin/content/:key — edit a block's title/body. Keys are fixed (see
+ * migrations/0009_content_blocks.sql) — this updates an existing block's
+ * text, it doesn't create new ones the app has nowhere to render.
+ */
+router.patch(
+  '/content/:key',
+  asyncHandler(async (req, res) => {
+    const input = z.object({ title: z.string().min(1).optional(), body: z.string().min(1).optional() }).parse(req.body);
+    if (!Object.keys(input).length) throw new HttpError(400, 'Nothing to update.');
+
+    const db = getDb();
+    const [row] = await db
+      .update(contentBlocks)
+      .set({ ...input, updatedAt: new Date() })
+      .where(eq(contentBlocks.key, param(req, 'key')))
+      .returning();
+    if (!row) throw new HttpError(404, 'Content block not found');
+    res.json({ key: row.key, title: row.title, body: row.body, updatedAt: row.updatedAt.toISOString() });
   }),
 );
 

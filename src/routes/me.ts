@@ -20,6 +20,7 @@ import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
 import { insertLab, labInputSchema, toLab, toPrescription } from './practice';
 import { asyncHandler, param } from '../lib/http';
+import { auditAccess } from '../middleware/audit';
 import { requireAuth } from '../middleware/auth';
 
 const router = Router();
@@ -204,6 +205,7 @@ function toDocument(d: DocumentRow) {
 /** GET /me/documents — the user's uploaded credentials, newest first. */
 router.get(
   '/documents',
+  auditAccess('document'),
   asyncHandler(async (req, res) => {
     const rows = await getDb()
       .select()
@@ -221,6 +223,7 @@ router.get(
  */
 router.post(
   '/documents',
+  auditAccess('document'),
   asyncHandler(async (req, res) => {
     const input = z
       .object({
@@ -254,6 +257,7 @@ router.post(
 /** DELETE /me/documents/:id — scoped to the owner. */
 router.delete(
   '/documents/:id',
+  auditAccess('document'),
   asyncHandler(async (req, res) => {
     const [row] = await getDb()
       .delete(documents)
@@ -273,6 +277,7 @@ router.delete(
  */
 router.get(
   '/prescriptions',
+  auditAccess('prescription'),
   asyncHandler(async (req, res) => {
     const rows = await getDb()
       .select()
@@ -288,6 +293,7 @@ router.get(
 /** GET /me/labs — the signed-in patient's own lab results. */
 router.get(
   '/labs',
+  auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const rows = await getDb()
       .select()
@@ -301,6 +307,7 @@ router.get(
 /** POST /me/labs — patient logs their own result (e.g. an outside test). */
 router.post(
   '/labs',
+  auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const input = labInputSchema.parse(req.body);
     const row = await insertLab(req.user!.id, input);
@@ -311,6 +318,7 @@ router.post(
 /** DELETE /me/labs/:id — scoped to the owner. */
 router.delete(
   '/labs/:id',
+  auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const [row] = await getDb()
       .delete(labs)

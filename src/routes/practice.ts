@@ -24,7 +24,9 @@ import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatClockTime, formatJoined, formatNaira } from '../lib/format';
+import { auditAccess } from '../middleware/audit';
 import { requireAuth, requireAccountType } from '../middleware/auth';
+import { getDoctorAvailability, setDoctorAvailability } from '../services/availability';
 import { notify } from '../services/notify';
 import { toAppointment } from './appointments';
 
@@ -133,6 +135,50 @@ router.get(
   }),
 );
 
+/** Shape returned/accepted for a single availability block. */
+function toAvailabilityBlock(b: { id: string; weekday: number; startMinute: number; endMinute: number; slotMinutes: number }) {
+  return { id: b.id, weekday: b.weekday, startMinute: b.startMinute, endMinute: b.endMinute, slotMinutes: b.slotMinutes };
+}
+
+/** GET /practice/availability — the signed-in doctor's recurring weekly working hours. */
+router.get(
+  '/availability',
+  asyncHandler(async (req, res) => {
+    const docId = await doctorIdFor(req.user!.id);
+    if (!docId) {
+      res.json([]); // no linked profile yet
+      return;
+    }
+    const blocks = await getDoctorAvailability(docId);
+    res.json(blocks.map(toAvailabilityBlock));
+  }),
+);
+
+const availabilityBlockInputSchema = z
+  .object({
+    weekday: z.number().int().min(0).max(6),
+    startMinute: z.number().int().min(0).max(1439),
+    endMinute: z.number().int().min(1).max(1440),
+    slotMinutes: z.number().int().positive().default(60),
+  })
+  .refine((b) => b.endMinute > b.startMinute, { message: 'End time must be after start time.' });
+
+/**
+ * PUT /practice/availability — replace the signed-in doctor's whole weekly
+ * schedule in one call, matching the "set my hours" screen's single Save
+ * button rather than editing one block at a time.
+ */
+router.put(
+  '/availability',
+  asyncHandler(async (req, res) => {
+    const docId = await doctorIdFor(req.user!.id);
+    if (!docId) throw new HttpError(403, 'No doctor profile is linked to this account yet.');
+    const { blocks } = z.object({ blocks: z.array(availabilityBlockInputSchema) }).parse(req.body);
+    const saved = await setDoctorAvailability(docId, blocks);
+    res.json(saved.map(toAvailabilityBlock));
+  }),
+);
+
 /**
  * GET /practice/appointments — the doctor's own appointments.
  *
@@ -191,6 +237,39 @@ router.post(
       existing.patientId,
       'Appointment Accepted — Payment Required',
       `${existing.doctorName} accepted your ${existing.date} ${existing.time} request. Pay ${existing.fee ?? 'the fee'} to confirm it.`,
+    );
+    res.json(toAppointment(row!));
+  }),
+);
+
+/**
+ * POST /practice/appointments/:id/no-show — doctor marks the patient as not
+ * attending. Manual only this batch — no automatic detection, since that
+ * needs a scheduler that doesn't exist yet. Guarded to only fire once the
+ * visit's start time has actually passed, so a doctor can't jump the gun.
+ */
+router.post(
+  '/appointments/:id/no-show',
+  asyncHandler(async (req, res) => {
+    const existing = await ownedAppointment(req.user!.id, param(req, 'id'));
+    if (!['upcoming', 'checked_in'].includes(existing.status)) {
+      throw new HttpError(409, `This appointment can't be marked no-show (it is ${existing.status}).`);
+    }
+    if (!existing.startAt || existing.startAt > new Date()) {
+      throw new HttpError(409, "This appointment hasn't started yet.");
+    }
+
+    const db = getDb();
+    const [row] = await db
+      .update(appointments)
+      .set({ status: 'no_show' })
+      .where(eq(appointments.id, existing.id))
+      .returning();
+
+    await notify(
+      existing.patientId,
+      'Marked as No-Show',
+      `You were marked as not attending your ${existing.date} ${existing.time} appointment with ${existing.doctorName}.`,
     );
     res.json(toAppointment(row!));
   }),
@@ -274,6 +353,7 @@ const noteInputSchema = z.object({
  */
 router.get(
   '/patients/:patientId/notes',
+  auditAccess('medical_note'),
   asyncHandler(async (req, res) => {
     const db = getDb();
     const myDocId = await doctorIdFor(req.user!.id);
@@ -294,6 +374,7 @@ router.get(
  */
 router.post(
   '/patients/:patientId/notes',
+  auditAccess('medical_note'),
   asyncHandler(async (req, res) => {
     const input = noteInputSchema.parse(req.body);
     const db = getDb();
@@ -331,6 +412,7 @@ router.post(
  */
 router.patch(
   '/notes/:noteId',
+  auditAccess('medical_note'),
   asyncHandler(async (req, res) => {
     const input = noteInputSchema.parse(req.body);
     const db = getDb();
@@ -368,6 +450,7 @@ router.patch(
  */
 router.post(
   '/notes/:noteId/amendments',
+  auditAccess('medical_note'),
   asyncHandler(async (req, res) => {
     const { text } = z.object({ text: z.string().min(1).max(2000) }).parse(req.body);
     const db = getDb();
@@ -421,6 +504,7 @@ export function toPrescription(p: PrescriptionRow) {
  */
 router.get(
   '/patients/:patientId/prescriptions',
+  auditAccess('prescription'),
   asyncHandler(async (req, res) => {
     const db = getDb();
     const patientId = await resolvePatientId(param(req, 'patientId'));
@@ -440,6 +524,7 @@ router.get(
  */
 router.post(
   '/patients/:patientId/prescriptions',
+  auditAccess('prescription'),
   asyncHandler(async (req, res) => {
     const input = z
       .object({
@@ -558,6 +643,7 @@ export async function insertLab(patientId: string, input: z.infer<typeof labInpu
 /** GET /practice/patients/:patientId/labs — a patient's lab results. */
 router.get(
   '/patients/:patientId/labs',
+  auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const patientId = await resolvePatientId(param(req, 'patientId'));
     const rows = await getDb()
@@ -572,6 +658,7 @@ router.get(
 /** POST /practice/patients/:patientId/labs — add a lab result for the patient. */
 router.post(
   '/patients/:patientId/labs',
+  auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const input = labInputSchema.parse(req.body);
     const patientId = await resolvePatientId(param(req, 'patientId'));
@@ -583,6 +670,7 @@ router.post(
 /** DELETE /practice/patients/:patientId/labs/:id */
 router.delete(
   '/patients/:patientId/labs/:id',
+  auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const patientId = await resolvePatientId(param(req, 'patientId'));
     const [row] = await getDb()

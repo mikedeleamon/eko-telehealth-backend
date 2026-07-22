@@ -44,6 +44,20 @@ export const users = pgTable('users', {
    * they can communicate with, not which language the UI renders in.
    */
   spokenLanguages: jsonb('spoken_languages').$type<string[]>().notNull().default([]),
+  /**
+   * Display currency preference (task 2.4) — NGN converted to this for
+   * browsing/checkout preview only. The platform's canonical pricing and
+   * settlement currency is always NGN (see lib/pricing.ts); this never
+   * changes what's actually charged, only what a patient sees it as.
+   */
+  preferredCurrency: text('preferred_currency').notNull().default('NGN'),
+  /**
+   * Login 2FA opt-in. When true, /auth/login sends an email code and returns
+   * a challenge instead of a session — /auth/login/verify-2fa completes it.
+   * Reuses the same verificationCodes/issueCode/checkCode machinery signup
+   * and password reset already use.
+   */
+  twoFactorEnabled: boolean('two_factor_enabled').notNull().default(false),
 });
 
 export const doctors = pgTable('doctors', {
@@ -77,6 +91,28 @@ export const doctors = pgTable('doctors', {
   spokenLanguages: jsonb('spoken_languages').$type<string[]>().notNull().default([]),
 });
 
+/**
+ * A doctor's recurring weekly working hours (task: scheduling foundation).
+ * Multiple rows per weekday are allowed (e.g. 9-12 and 2-6 for a split
+ * shift) — there's deliberately no unique constraint on (doctorId, weekday).
+ * Minutes are plain integers (minutes since midnight, Africa/Lagos local —
+ * see lib/timezone.ts) rather than a Postgres `time` column: the whole
+ * platform is hardcoded to one timezone, so slot generation is pure
+ * arithmetic and doesn't need a temporal column type.
+ */
+export const doctorAvailability = pgTable('doctor_availability', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  doctorId: uuid('doctor_id')
+    .references(() => doctors.id)
+    .notNull(),
+  /** 0 = Sunday, matching JS Date.getDay(). */
+  weekday: integer('weekday').notNull(),
+  startMinute: integer('start_minute').notNull(),
+  endMinute: integer('end_minute').notNull(),
+  slotMinutes: integer('slot_minutes').notNull().default(60),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
 export const appointments = pgTable('appointments', {
   id: uuid('id').defaultRandom().primaryKey(),
   patientId: uuid('patient_id')
@@ -85,20 +121,44 @@ export const appointments = pgTable('appointments', {
   doctorId: uuid('doctor_id').references(() => doctors.id),
   doctorName: text('doctor_name').notNull(),
   specialty: text('specialty').notNull(),
+  /**
+   * Display-ready strings, server-computed from `startAt` below — kept so
+   * every existing screen that renders `appointment.date`/`.time` as text
+   * works unchanged. NULL `startAt` (legacy/seeded rows, or the pre-slot-model
+   * era) means these were the client-supplied free text instead.
+   */
   date: text('date').notNull(),
   time: text('time').notNull(),
+  /**
+   * Real source of truth for the visit's start (task: scheduling foundation).
+   * Nullable — legacy rows booked before this shipped have no reliable way to
+   * backfill it (the old `time` format, e.g. '01-02:00', has no AM/PM) and are
+   * simply excluded from slot-collision checks. Every new booking sets this.
+   */
+  startAt: timestamp('start_at', { withTimezone: true }),
   type: text('type').$type<'Video Visit' | 'Clinic Visit' | 'Home Visit'>().notNull(),
   /**
    * Booking lifecycle:
    *   pending_approval → the doctor has not accepted yet (initial state)
    *   pending_payment  → accepted; awaiting the patient's payment
    *   upcoming         → paid + confirmed (set only by a verified payment webhook)
+   *   checked_in       → the patient marked themselves present/ready ahead of the visit
    *   declined         → the doctor rejected the request
    *   cancelled        → the patient cancelled
+   *   no_show          → the doctor marked the patient as not attending
    *   past             → the visit happened
    */
   status: text('status')
-    .$type<'pending_approval' | 'pending_payment' | 'upcoming' | 'declined' | 'cancelled' | 'past'>()
+    .$type<
+      | 'pending_approval'
+      | 'pending_payment'
+      | 'upcoming'
+      | 'checked_in'
+      | 'declined'
+      | 'cancelled'
+      | 'no_show'
+      | 'past'
+    >()
     .notNull()
     .default('pending_approval'),
   reason: text('reason'),
@@ -286,6 +346,44 @@ export const platformSettings = pgTable('platform_settings', {
 });
 
 /**
+ * Display currencies (task 2.4) — admin-managed exchange rates used ONLY to
+ * convert a canonical-NGN fee into a patient's preferred display currency
+ * (browsing + payment preview). This is display, not settlement: what's
+ * actually charged is always computed in NGN by lib/pricing.ts, or converted
+ * to PayPal's configured currency at env.paypal.ngnRate — this table and
+ * that rate are deliberately separate, since a checkout in flight must not
+ * shift value if an admin edits a display rate mid-session.
+ *
+ * NGN itself is a row here (rate 1) so the currency picker has one uniform
+ * list instead of special-casing the base currency everywhere it's shown.
+ */
+export const currencies = pgTable('currencies', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  /** ISO 4217, e.g. 'USD'. */
+  code: text('code').notNull().unique(),
+  symbol: text('symbol').notNull(),
+  /** NGN per 1 unit of this currency, e.g. USD → 1600 (matches env.paypal.ngnRate's convention: convert with amountNgn / ngnRate). NGN's own row is 1. */
+  ngnRate: doublePrecision('ngn_rate').notNull(),
+  active: boolean('active').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Admin-editable prose content (task 2.2) — a curated set of blocks (About Us
+ * mission/contact, Terms of Service, Privacy Policy), not a general-purpose
+ * page builder. `key` is a fixed, code-referenced slug (see seed.ts for the
+ * full set) — the admin editor can update a key's text but not invent new
+ * ones the app doesn't already render somewhere.
+ */
+export const contentBlocks = pgTable('content_blocks', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  key: text('key').notNull().unique(),
+  title: text('title').notNull(),
+  body: text('body').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
  * The doctor wallet: one row per earning (a visit's payout, credited when
  * webhooks.ts confirms payment) or withdrawal (routes/practice.ts POST
  * /payouts). GET /practice/earnings derives balance/pending/thisMonth from
@@ -349,7 +447,17 @@ export const reviews = pgTable('reviews', {
   author: text('author').notNull(),
   subject: text('subject').notNull(),
   direction: text('direction').$type<'patient→provider' | 'provider→patient'>().notNull(),
+  /** Overall score — the rounded average of the three dimensions below. Drives distribution/average in /reviews/summary. */
   rating: integer('rating').notNull(),
+  /**
+   * Per-dimension ratings (task: multi-dimension ratings) — Communication,
+   * Experience, Speedy Response, restoring categories the patient-feedback
+   * memo flagged as dropped from the mockups. Nullable: reviews submitted
+   * before this shipped have none.
+   */
+  communicationRating: integer('communication_rating'),
+  experienceRating: integer('experience_rating'),
+  speedyResponseRating: integer('speedy_response_rating'),
   /** Optional App Store-style headline for the review. */
   title: text('title'),
   text: text('text').notNull(),
@@ -599,8 +707,30 @@ export const medicalNotes = pgTable('medical_notes', {
   updatedAt: timestamp('updated_at', { withTimezone: true }),
 });
 
+/**
+ * Who touched a clinical record and when — every read and write of
+ * medical_notes/prescriptions/labs/documents, written by the auditAccess
+ * middleware (see middleware/audit.ts). Write-only for v1: no admin viewer,
+ * queried directly for a compliance audit.
+ */
+export const auditLog = pgTable('audit_log', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  actorId: uuid('actor_id').notNull().references(() => users.id),
+  actorAccountType: text('actor_account_type').notNull(),
+  action: text('action').$type<'read' | 'create' | 'update' | 'delete'>().notNull(),
+  resourceType: text('resource_type').$type<'document' | 'prescription' | 'lab' | 'medical_note'>().notNull(),
+  // Best-effort — a specific record id when the route has one, null for a
+  // list read (e.g. GET /me/labs has no single record to name).
+  resourceId: text('resource_id'),
+  // The patient the record concerns, when known from the route.
+  subjectId: text('subject_id'),
+  statusCode: integer('status_code').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
 export type UserRow = typeof users.$inferSelect;
 export type DoctorRow = typeof doctors.$inferSelect;
+export type DoctorAvailabilityRow = typeof doctorAvailability.$inferSelect;
 export type AppointmentRow = typeof appointments.$inferSelect;
 export type DependentRow = typeof dependents.$inferSelect;
 export type UserSettingsRow = typeof userSettings.$inferSelect;
@@ -608,9 +738,12 @@ export type DocumentRow = typeof documents.$inferSelect;
 export type PrescriptionRow = typeof prescriptions.$inferSelect;
 export type LabRow = typeof labs.$inferSelect;
 export type MedicalNoteRow = typeof medicalNotes.$inferSelect;
+export type AuditLogRow = typeof auditLog.$inferSelect;
 export type PaymentRow = typeof payments.$inferSelect;
 export type PlatformSettingsRow = typeof platformSettings.$inferSelect;
 export type EarningsLedgerRow = typeof earningsLedger.$inferSelect;
 export type PromoCodeRow = typeof promoCodes.$inferSelect;
 export type PromoRedemptionRow = typeof promoRedemptions.$inferSelect;
 export type ComplaintRow = typeof complaints.$inferSelect;
+export type CurrencyRow = typeof currencies.$inferSelect;
+export type ContentBlockRow = typeof contentBlocks.$inferSelect;

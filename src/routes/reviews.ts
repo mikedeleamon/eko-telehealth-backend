@@ -19,6 +19,9 @@ function toReview(r: typeof reviews.$inferSelect) {
     title: r.title ?? undefined,
     verified: r.verified,
     comments: r.commentsCount,
+    communicationRating: r.communicationRating ?? undefined,
+    experienceRating: r.experienceRating ?? undefined,
+    speedyResponseRating: r.speedyResponseRating ?? undefined,
   };
 }
 
@@ -86,14 +89,19 @@ router.post(
   '/',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { subject, rating, text, title } = z
+    const { subject, communicationRating, experienceRating, speedyResponseRating, text, title } = z
       .object({
         subject: z.string().min(1),
-        rating: z.number().int().min(1).max(5),
+        communicationRating: z.number().int().min(1).max(5),
+        experienceRating: z.number().int().min(1).max(5),
+        speedyResponseRating: z.number().int().min(1).max(5),
         text: z.string().min(3),
         title: z.string().max(80).optional(),
       })
       .parse(req.body);
+    // Overall score is derived, not picked separately — see the schema note
+    // on reviews.rating.
+    const rating = Math.round((communicationRating + experienceRating + speedyResponseRating) / 3);
 
     const db = getDb();
     const [author] = await db.select().from(users).where(eq(users.id, req.user!.id));
@@ -115,6 +123,9 @@ router.post(
         subject,
         direction: req.user!.accountType === 'Doctor' ? 'provider→patient' : 'patient→provider',
         rating,
+        communicationRating,
+        experienceRating,
+        speedyResponseRating,
         title: title ?? null,
         text,
         verified: !!priorVisit,
