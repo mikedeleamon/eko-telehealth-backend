@@ -15,7 +15,7 @@ router.post(
   '/presign',
   asyncHandler(async (req, res) => {
     const { kind, contentType } = z
-      .object({ kind: z.enum(['avatar', 'provider-doc', 'document', 'lab']), contentType: z.string().min(1) })
+      .object({ kind: z.enum(['avatar', 'provider-doc', 'document', 'lab', 'gov-id']), contentType: z.string().min(1) })
       .parse(req.body);
 
     const PREFIXES: Record<typeof kind, string> = {
@@ -23,6 +23,7 @@ router.post(
       'provider-doc': `provider-docs/${req.user!.id}`,
       document: `documents/${req.user!.id}`,
       lab: `labs/${req.user!.id}`,
+      'gov-id': `gov-id/${req.user!.id}`,
     };
     const prefix = PREFIXES[kind];
     const result = await presignUpload(prefix, contentType);

@@ -18,6 +18,7 @@ export function toAppointment(a: AppointmentRow) {
   return {
     id: a.id,
     doctor: a.doctorName,
+    doctorId: a.doctorId ?? undefined,
     specialty: a.specialty,
     date: a.date,
     time: a.time,
@@ -26,6 +27,11 @@ export function toAppointment(a: AppointmentRow) {
     status: a.status,
     fee: a.fee ?? undefined,
     declineReason: a.declineReason ?? undefined,
+    isPeerReview: a.isPeerReview,
+    isCaseConference: a.isCaseConference,
+    // Which dependent this visit was booked for (proxy access) — undefined
+    // when the account holder booked for themselves.
+    dependentId: a.dependentId ?? undefined,
   };
 }
 
@@ -61,6 +67,10 @@ router.post(
         type: z.enum(['Video Visit', 'Clinic Visit', 'Home Visit']),
         reason: z.string().optional(),
         dependentId: z.string().uuid().optional(),
+        /** A paid 2nd-opinion request (BRD 1.4) rather than an ordinary visit — same booking pipeline, just flagged. */
+        isPeerReview: z.boolean().optional(),
+        /** A proxy's paid case-conference request (BRD 1.2) about a dependent's care — same booking pipeline, just flagged. */
+        isCaseConference: z.boolean().optional(),
       })
       .parse(req.body);
 
@@ -111,6 +121,8 @@ router.post(
           type: input.type,
           reason: input.reason,
           dependentId: input.dependentId,
+          isPeerReview: input.isPeerReview ?? false,
+          isCaseConference: input.isCaseConference ?? false,
           fee: doctor.fee,
           status: 'pending_approval',
         })
@@ -125,16 +137,21 @@ router.post(
       throw err;
     }
 
+    const visitLabel = input.isPeerReview
+      ? 'second opinion request'
+      : input.isCaseConference
+        ? 'case conference request'
+        : input.type.toLowerCase();
     await notify(
       req.user!.id,
       'Request Sent',
-      `Your ${input.type.toLowerCase()} request to ${doctor.name} for ${date} at ${time} is awaiting approval.`,
+      `Your ${visitLabel} to ${doctor.name} for ${date} at ${time} is awaiting approval.`,
     );
     if (doctor.userId) {
       await notify(
         doctor.userId,
-        'New Appointment Request',
-        `A patient requested a ${input.type.toLowerCase()} on ${date} at ${time}.`,
+        input.isPeerReview ? 'New Second Opinion Request' : input.isCaseConference ? 'New Case Conference Request' : 'New Appointment Request',
+        `A patient requested a ${visitLabel} on ${date} at ${time}.`,
       );
     }
 

@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
 
-export type AccountType = 'Patient' | 'Doctor' | 'Admin';
+export type AccountType = 'Patient' | 'Doctor' | 'Provider' | 'Admin';
 
 export interface AccessPayload {
   sub: string;

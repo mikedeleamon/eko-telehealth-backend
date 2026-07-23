@@ -6,6 +6,7 @@ import { appointments, complaints, users, type ComplaintRow } from '../db/schema
 import { HttpError } from '../lib/errors';
 import { asyncHandler } from '../lib/http';
 import { requireAuth } from '../middleware/auth';
+import { isProviderAccountType } from '../lib/providerAccess';
 
 const router = Router();
 router.use(requireAuth);
@@ -76,7 +77,7 @@ router.post(
       .values({
         userId: req.user!.id,
         authorName,
-        accountType: req.user!.accountType === 'Doctor' ? 'Doctor' : 'Patient',
+        accountType: isProviderAccountType(req.user!.accountType) ? req.user!.accountType : 'Patient',
         category: input.category,
         subject: input.subject,
         description: input.description,

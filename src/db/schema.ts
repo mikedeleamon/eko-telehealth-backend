@@ -28,14 +28,45 @@ export const users = pgTable('users', {
   // predate phone capture and reset by email instead.
   phone: text('phone').unique(),
   passwordHash: text('password_hash').notNull(),
-  // The account's permission type. Resolved from this column at login; the
-  // client never sends it. Admins sign in through the admin console only.
-  accountType: text('account_type').$type<'Patient' | 'Doctor' | 'Admin'>().notNull().default('Patient'),
+  /**
+   * The account's permission type. Resolved from this column at login; the
+   * client never sends it. Admins sign in through the admin console only.
+   *
+   * 'Provider' is the generic bucket for every non-Doctor provider type
+   * (Therapist, Nurse, Pharmacy, ...) — the SPECIFIC domain type lives on
+   * `providerApplications.type` and, once approved, the entity created for
+   * it (e.g. `doctors.providerType`). This enum deliberately does NOT grow
+   * one value per provider type — 'Doctor' is kept only as a legacy alias
+   * for accounts created before this existed; new provider signups all use
+   * 'Provider'. See lib/providerAccess.ts's isProviderAccountType().
+   */
+  accountType: text('account_type').$type<'Patient' | 'Doctor' | 'Provider' | 'Admin'>().notNull().default('Patient'),
   status: text('status').$type<'active' | 'suspended'>().notNull().default('active'),
   // True for every row by construction: accounts are only created by
   // /auth/verify promoting a pending_signups row, so a user cannot exist
   // without a verified email. Kept as an explicit record of that.
   emailVerified: boolean('email_verified').notNull().default(false),
+  /**
+   * Set by /auth/verify (sms channel) once the account holder's phone number
+   * has been OTP-checked. Defaults true — safe for accounts created outside
+   * the self-service signup flow (seeds, legacy rows, any future admin-
+   * created account) that never needed the OTP gate. The ONE place that
+   * actually needs the unverified starting state is promotePendingSignup
+   * (routes/auth.ts), which explicitly overrides this to false for every
+   * fresh signup, kicking off the mandatory post-signup phone-verify step.
+   */
+  phoneVerified: boolean('phone_verified').notNull().default(true),
+  /**
+   * Government-ID verification (SOW 1.9 — previously only enforced for
+   * providers via provider_applications.checkGovId; patients had no
+   * equivalent). Self-service submit (PUT /me/gov-id), admin-reviewed
+   * (PATCH /admin/users/:id/gov-id) — not a booking gate, purely a trust
+   * signal, same additive spirit as canProvideInHome/pharmacies.active.
+   * 'none' until a document is submitted.
+   */
+  govIdStatus: text('gov_id_status').$type<'none' | 'pending' | 'verified' | 'rejected'>().notNull().default('none'),
+  govIdKey: text('gov_id_key'),
+  govIdFileName: text('gov_id_file_name'),
   joinedAt: timestamp('joined_at', { withTimezone: true }).defaultNow().notNull(),
   /**
    * Languages this account holder speaks (task 2.5) — personal, editable
@@ -89,6 +120,16 @@ export const doctors = pgTable('doctors', {
    * after that, consistent with those other fields.
    */
   spokenLanguages: jsonb('spoken_languages').$type<string[]>().notNull().default([]),
+  /**
+   * Batch 3 Phase 2 — which appointment-based provider this row actually is.
+   * Everything else about this table (availability, appointments, earnings,
+   * chat, discovery) is shared as-is across all three; only clinical-
+   * authoring capability (prescribe/order labs/author notes) forks on this,
+   * via lib/providerCapabilities.ts. Pharmacy/Lab/Clinic never land here —
+   * they're fulfillment/location entities, not appointment-based (see the
+   * Batch 3 scoping memo's 3-way domain split).
+   */
+  providerType: text('provider_type').$type<'Doctor' | 'Nurse' | 'Therapist'>().notNull().default('Doctor'),
 });
 
 /**
@@ -162,6 +203,22 @@ export const appointments = pgTable('appointments', {
     .notNull()
     .default('pending_approval'),
   reason: text('reason'),
+  /**
+   * A paid 2nd-opinion request (BRD 1.4 "Peer Reviews") rather than an
+   * ordinary visit — same booking/payment/appointment machinery end to end,
+   * just flagged so the UI can frame it differently. `reason` carries what
+   * the patient wants reviewed (there's no structured link to a prior
+   * diagnosis record — patients have no browsable view of their own EMR
+   * today, so free text is what's actually usable here).
+   */
+  isPeerReview: boolean('is_peer_review').notNull().default(false),
+  /**
+   * A proxy's paid case-conference request (BRD 1.2 "Proxies") to discuss a
+   * dependent's overall treatment with one of their treating doctors —
+   * always booked with `dependentId` set. Same booking pipeline as any
+   * other visit, just flagged for framing, exactly like isPeerReview above.
+   */
+  isCaseConference: boolean('is_case_conference').notNull().default(false),
   /** Set when booking on behalf of a dependent (proxy access). */
   dependentId: uuid('dependent_id'),
   fee: text('fee'),
@@ -437,7 +494,37 @@ export const providerApplications = pgTable('provider_applications', {
   checkGovId: boolean('check_gov_id').notNull().default(false),
   checkEmail: boolean('check_email').notNull().default(false),
   checkPhone: boolean('check_phone').notNull().default(false),
+  /**
+   * Verification documents (license, gov ID scan, ...) the applicant
+   * uploaded to R2 — presigned via POST /uploads/presign kind:'provider-doc'
+   * (see routes/uploads.ts), then attached here at submit time. Not required
+   * to submit — the admin still makes the approve/reject call either way,
+   * same as the three check booleans above; documents just give them
+   * something real to look at instead of only self-reported checkboxes.
+   */
+  documents: jsonb('documents')
+    .$type<{ key: string; fileName: string; mimeType: string; sizeBytes: number; uploadedAt: string }[]>()
+    .notNull()
+    .default([]),
   status: text('status').$type<'pending' | 'approved' | 'rejected'>().notNull().default('pending'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * A pharmacy in the admin-curated directory (Batch 3 Phase 3). Directory
+ * entity first, not a dashboard — created the same way Doctor/Nurse/
+ * Therapist entities are, by approving a `providerApplications` row of type
+ * 'Pharmacy' (see routes/admin.ts's createEntityForApproval). No self-service
+ * login/dispense UI this batch; `active` is the only admin-editable field,
+ * mirroring doctors.canProvideInHome's toggle-not-full-CRUD scope.
+ */
+export const pharmacies = pgTable('pharmacies', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id').references(() => users.id),
+  name: text('name').notNull(),
+  address: text('address').notNull(),
+  fax: text('fax').notNull().default(''),
+  active: boolean('active').notNull().default(true),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -486,7 +573,7 @@ export const complaints = pgTable('complaints', {
     .references(() => users.id)
     .notNull(),
   authorName: text('author_name').notNull(),
-  accountType: text('account_type').$type<'Patient' | 'Doctor'>().notNull(),
+  accountType: text('account_type').$type<'Patient' | 'Doctor' | 'Provider'>().notNull(),
   category: text('category').$type<'billing' | 'appointment' | 'provider' | 'technical' | 'other'>().notNull(),
   subject: text('subject').notNull(),
   description: text('description').notNull(),
@@ -522,7 +609,7 @@ export const pendingSignups = pgTable('pending_signups', {
    */
   phone: text('phone'),
   passwordHash: text('password_hash').notNull(),
-  accountType: text('account_type').$type<'Patient' | 'Doctor'>().notNull().default('Patient'),
+  accountType: text('account_type').$type<'Patient' | 'Doctor' | 'Provider'>().notNull().default('Patient'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -571,16 +658,26 @@ export const insuranceInfo = pgTable('insurance_info', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
-/** One preferred pharmacy per user (GET/PUT /me/pharmacy). */
+/**
+ * One preferred pharmacy per user (GET/PUT /me/pharmacy). Batch 3 Phase 3:
+ * can now reference a real directory `pharmacies` row (in-network) instead
+ * of only free text — `name`/`address`/`fax` stay as the out-of-network
+ * fallback for a pharmacy that isn't in the directory, so a patient's own
+ * pharmacy is never blocked on it being onboarded first. Exactly one of
+ * `pharmacyId` or `address`+`fax` is set, enforced client-side (PUT /me/
+ * pharmacy accepts either shape) — not worth a DB constraint for a
+ * single-row-per-user preference.
+ */
 export const pharmacyPreferences = pgTable('pharmacy_preferences', {
   id: uuid('id').defaultRandom().primaryKey(),
   userId: uuid('user_id')
     .references(() => users.id)
     .notNull()
     .unique(),
+  pharmacyId: uuid('pharmacy_id').references(() => pharmacies.id),
   name: text('name'),
-  address: text('address').notNull(),
-  fax: text('fax').notNull(),
+  address: text('address'),
+  fax: text('fax'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -628,6 +725,28 @@ export const documents = pgTable('documents', {
 });
 
 /**
+ * A patient's current vitals — one row per patient, upserted, not a history
+ * (no chart/trend UI exists to consume a time series, so there's nothing to
+ * gain from storing one). `patientId` follows the same dual-space rule as
+ * prescriptions/labs: a roster id when a doctor records it, a user id when
+ * the patient self-reports via /me/biometrics — no FK, see rosterPatients.
+ */
+export const biometrics = pgTable('biometrics', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  patientId: uuid('patient_id').notNull().unique(),
+  bloodPressure: text('blood_pressure'),
+  heartRate: text('heart_rate'),
+  temperature: text('temperature'),
+  weight: text('weight'),
+  height: text('height'),
+  bmi: text('bmi'),
+  bloodType: text('blood_type'),
+  /** Display date, e.g. "Jul 23, 2026" — matches every other "recorded on" field in this schema. */
+  recordedAt: text('recorded_at').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
  * A prescription on a patient's medication record. `patientId` holds a roster
  * patient id when written by a doctor (practice routes) or a user id for a
  * patient's own record (/me/prescriptions) — two different id spaces, so no FK.
@@ -649,6 +768,14 @@ export const prescriptions = pgTable('prescriptions', {
   doctorId: uuid('doctor_id').references(() => doctors.id),
   doctorName: text('doctor_name').notNull(),
   datePrescribed: text('date_prescribed').notNull(),
+  /**
+   * Which directory pharmacy this should fill at (Batch 3 Phase 3) — column
+   * only this phase, nullable and unpopulated by any route yet. The actual
+   * routing UX (auto-fill from the patient's preference, fulfillment status)
+   * is the Referrals & Fulfillment batch's job, which needs this FK to exist
+   * first rather than adding it alongside a schema migration then too.
+   */
+  pharmacyId: uuid('pharmacy_id').references(() => pharmacies.id),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -735,6 +862,7 @@ export type AppointmentRow = typeof appointments.$inferSelect;
 export type DependentRow = typeof dependents.$inferSelect;
 export type UserSettingsRow = typeof userSettings.$inferSelect;
 export type DocumentRow = typeof documents.$inferSelect;
+export type BiometricsRow = typeof biometrics.$inferSelect;
 export type PrescriptionRow = typeof prescriptions.$inferSelect;
 export type LabRow = typeof labs.$inferSelect;
 export type MedicalNoteRow = typeof medicalNotes.$inferSelect;
@@ -747,3 +875,5 @@ export type PromoRedemptionRow = typeof promoRedemptions.$inferSelect;
 export type ComplaintRow = typeof complaints.$inferSelect;
 export type CurrencyRow = typeof currencies.$inferSelect;
 export type ContentBlockRow = typeof contentBlocks.$inferSelect;
+export type PharmacyRow = typeof pharmacies.$inferSelect;
+export type PharmacyPreferenceRow = typeof pharmacyPreferences.$inferSelect;

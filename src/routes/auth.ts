@@ -12,7 +12,9 @@ import { sendEmail } from '../services/email';
 import { normalizeMsisdn, sendSms } from '../services/sms';
 
 const router = Router();
-const accountTypeSchema = z.enum(['Patient', 'Doctor']);
+// 'Provider' is the generic bucket for every non-Doctor provider type — see
+// db/schema.ts's users.accountType doc comment.
+const accountTypeSchema = z.enum(['Patient', 'Doctor', 'Provider']);
 const channelSchema = z.enum(['email', 'sms']);
 
 /** Wrong guesses allowed against a destination before its codes are burned. */
@@ -286,6 +288,7 @@ router.post(
     const dest = normalizeDestination(destination, channel);
     await checkCode(dest, channel, code);
     if (channel === 'email') await promotePendingSignup(dest);
+    if (channel === 'sms') await markPhoneVerified(dest);
     res.json({ ok: true });
   }),
 );
@@ -328,8 +331,23 @@ async function promotePendingSignup(email: string): Promise<void> {
     passwordHash: pending.passwordHash,
     accountType: pending.accountType,
     emailVerified: true,
+    // Nothing to verify if there's no phone on file (dropped above, or never
+    // sent); otherwise start unverified — the mobile signup flow chains
+    // straight into a phone-verify step right after this, see markPhoneVerified.
+    phoneVerified: !phone,
   });
   await db.delete(pendingSignups).where(eq(pendingSignups.email, email));
+}
+
+/**
+ * Marks the account at `phone` as phone-verified. Deliberately general (not
+ * signup-specific) — the same POST /auth/verify (sms channel) call site also
+ * covers a future phone-number-change flow correctly, since re-verifying a
+ * new number should re-mark it verified the same way.
+ */
+async function markPhoneVerified(phone: string): Promise<void> {
+  const db = getDb();
+  await db.update(users).set({ phoneVerified: true }).where(eq(users.phone, phone));
 }
 
 /**

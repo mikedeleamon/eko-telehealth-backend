@@ -15,6 +15,7 @@ import doctorRoutes from './routes/doctors';
 import meRoutes from './routes/me';
 import notificationRoutes from './routes/notifications';
 import paymentRoutes from './routes/payments';
+import pharmacyRoutes from './routes/pharmacies';
 import practiceRoutes from './routes/practice';
 import providerRoutes from './routes/providers';
 import reviewRoutes from './routes/reviews';
@@ -71,6 +72,7 @@ export function createApp() {
   app.use('/reviews', reviewRoutes);
   app.use('/complaints', complaintRoutes);
   app.use('/currencies', currencyRoutes);
+  app.use('/pharmacies', pharmacyRoutes);
   app.use('/content', contentRoutes);
   app.use('/uploads', uploadRoutes);
 

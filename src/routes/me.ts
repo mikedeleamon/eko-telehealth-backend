@@ -4,21 +4,25 @@ import { z } from 'zod';
 import { getDb } from '../db/client';
 import {
   appointments,
+  biometrics,
   dependents,
   documents,
   insuranceInfo,
   labs,
   payments,
+  pharmacies,
   pharmacyPreferences,
   prescriptions,
   userSettings,
+  users,
   type DependentRow,
   type DocumentRow,
+  type PharmacyPreferenceRow,
   type UserSettingsRow,
 } from '../db/schema';
 import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
-import { insertLab, labInputSchema, toLab, toPrescription } from './practice';
+import { biometricsInputSchema, insertLab, labInputSchema, toBiometrics, toLab, toPrescription, upsertBiometrics } from './practice';
 import { asyncHandler, param } from '../lib/http';
 import { auditAccess } from '../middleware/audit';
 import { requireAuth } from '../middleware/auth';
@@ -141,6 +145,20 @@ router.put(
 
 // ── Preferred pharmacy ──────────────────────────────────────────────────────
 
+/**
+ * Resolve a saved preference to its display shape. When it references a
+ * directory pharmacy (Batch 3 Phase 3), the client gets that pharmacy's
+ * current name/address/fax — not a stale copy — plus `pharmacyId` so the UI
+ * knows it's an in-network pick rather than free text.
+ */
+async function resolvePharmacyPreference(pref: PharmacyPreferenceRow) {
+  if (pref.pharmacyId) {
+    const [pharmacy] = await getDb().select().from(pharmacies).where(eq(pharmacies.id, pref.pharmacyId));
+    if (pharmacy) return { pharmacyId: pharmacy.id, name: pharmacy.name, address: pharmacy.address, fax: pharmacy.fax };
+  }
+  return { pharmacyId: null, name: pref.name ?? undefined, address: pref.address ?? '', fax: pref.fax ?? '' };
+}
+
 /** GET /me/pharmacy — null when the user hasn't set one. */
 router.get(
   '/pharmacy',
@@ -149,24 +167,32 @@ router.get(
       .select()
       .from(pharmacyPreferences)
       .where(eq(pharmacyPreferences.userId, req.user!.id));
-    res.json(row ? { name: row.name ?? undefined, address: row.address, fax: row.fax } : null);
+    res.json(row ? await resolvePharmacyPreference(row) : null);
   }),
 );
 
-/** PUT /me/pharmacy — upsert; one preference per user. */
+/**
+ * PUT /me/pharmacy — upsert; one preference per user. Accepts either shape:
+ * `{ pharmacyId }` to pick a directory pharmacy (in-network), or
+ * `{ name?, address, fax }` free text for one that isn't in the directory
+ * (out-of-network fallback — never blocked on a pharmacy being onboarded).
+ */
+const pharmacyInputSchema = z.union([
+  z.object({ pharmacyId: z.string().min(1) }),
+  z.object({ name: z.string().optional(), address: z.string().min(1), fax: z.string().min(1) }),
+]);
+
 router.put(
   '/pharmacy',
   asyncHandler(async (req, res) => {
-    const input = z
-      .object({
-        name: z.string().optional(),
-        address: z.string().min(1),
-        fax: z.string().min(1),
-      })
-      .parse(req.body);
+    const input = pharmacyInputSchema.parse(req.body);
 
-    // Same as insurance: PUT replaces, so an omitted `name` clears it.
-    const values = { name: input.name ?? null, address: input.address, fax: input.fax };
+    // Same as insurance: PUT replaces, so switching shapes clears the other.
+    const values =
+      'pharmacyId' in input
+        ? { pharmacyId: input.pharmacyId, name: null, address: null, fax: null }
+        : { pharmacyId: null, name: input.name ?? null, address: input.address, fax: input.fax };
+
     const [row] = await getDb()
       .insert(pharmacyPreferences)
       .values({ ...values, userId: req.user!.id })
@@ -175,7 +201,48 @@ router.put(
         set: { ...values, updatedAt: new Date() },
       })
       .returning();
-    res.json({ name: row!.name ?? undefined, address: row!.address, fax: row!.fax });
+    res.json(await resolvePharmacyPreference(row!));
+  }),
+);
+
+// ── Government ID verification ──────────────────────────────────────────────
+
+function govIdUrl(key: string | null): string | null {
+  if (!key) return null;
+  const base = env.r2.publicBaseUrl;
+  return base ? `${base.replace(/\/$/, '')}/${key}` : key;
+}
+
+/** GET /me/gov-id — status of the signed-in user's own gov-ID verification. */
+router.get(
+  '/gov-id',
+  asyncHandler(async (req, res) => {
+    const [user] = await getDb().select().from(users).where(eq(users.id, req.user!.id));
+    if (!user) throw new HttpError(401, 'Session expired or invalid');
+    res.json({
+      status: user.govIdStatus,
+      fileName: user.govIdFileName ?? undefined,
+      url: govIdUrl(user.govIdKey),
+    });
+  }),
+);
+
+/**
+ * PUT /me/gov-id — submit (or resubmit after a rejection) a government-ID
+ * document for review. Always resets status to 'pending' — not a booking
+ * gate, so there's no reason to block a resubmit.
+ */
+router.put(
+  '/gov-id',
+  asyncHandler(async (req, res) => {
+    const { key, fileName } = z.object({ key: z.string().min(1), fileName: z.string().min(1) }).parse(req.body);
+    const [user] = await getDb()
+      .update(users)
+      .set({ govIdStatus: 'pending', govIdKey: key, govIdFileName: fileName })
+      .where(eq(users.id, req.user!.id))
+      .returning();
+    if (!user) throw new HttpError(401, 'Session expired or invalid');
+    res.json({ status: user.govIdStatus, fileName: user.govIdFileName ?? undefined, url: govIdUrl(user.govIdKey) });
   }),
 );
 
@@ -265,6 +332,27 @@ router.delete(
       .returning();
     if (!row) throw new HttpError(404, 'Document not found');
     res.json({ ok: true });
+  }),
+);
+
+// ── Biometrics (vitals, patient self-view/report) ───────────────────────────
+
+/** GET /me/biometrics — the signed-in patient's own current vitals, or null. */
+router.get(
+  '/biometrics',
+  asyncHandler(async (req, res) => {
+    const [row] = await getDb().select().from(biometrics).where(eq(biometrics.patientId, req.user!.id));
+    res.json(toBiometrics(row));
+  }),
+);
+
+/** PUT /me/biometrics — self-report vitals (e.g. from a home cuff/scale). */
+router.put(
+  '/biometrics',
+  asyncHandler(async (req, res) => {
+    const input = biometricsInputSchema.parse(req.body);
+    const row = await upsertBiometrics(req.user!.id, input);
+    res.status(201).json(toBiometrics(row));
   }),
 );
 

@@ -5,6 +5,7 @@ import { getDb } from '../db/client';
 import {
   agendaItems,
   appointments,
+  biometrics,
   doctors,
   earningsLedger,
   labs,
@@ -13,6 +14,7 @@ import {
   prescriptions,
   rosterPatients,
   users,
+  type BiometricsRow,
   type EarningsLedgerRow,
   type LabRow,
   type MedicalNoteRow,
@@ -29,9 +31,13 @@ import { requireAuth, requireAccountType } from '../middleware/auth';
 import { getDoctorAvailability, setDoctorAvailability } from '../services/availability';
 import { notify } from '../services/notify';
 import { toAppointment } from './appointments';
+import { capabilitiesFor } from '../lib/providerCapabilities';
 
 const router = Router();
-router.use(requireAuth, requireAccountType('Doctor', 'Admin'));
+// 'Provider' covers Nurse/Therapist accounts too (Batch 3 Phase 2) — capability
+// (can this specific provider prescribe/order labs) is a narrower, per-route
+// check below, not an account-type gate.
+router.use(requireAuth, requireAccountType('Doctor', 'Provider', 'Admin'));
 
 /** Resolve the doctor profile linked to the signed-in doctor user (if any). */
 async function doctorIdFor(userId: string): Promise<string | null> {
@@ -118,6 +124,74 @@ router.get(
         lastVisit: p.lastVisit,
       })),
     );
+  }),
+);
+
+// ── Biometrics (vitals) ─────────────────────────────────────────────────────
+
+export function toBiometrics(b: BiometricsRow | undefined) {
+  if (!b) return null;
+  return {
+    bloodPressure: b.bloodPressure ?? undefined,
+    heartRate: b.heartRate ?? undefined,
+    temperature: b.temperature ?? undefined,
+    weight: b.weight ?? undefined,
+    height: b.height ?? undefined,
+    bmi: b.bmi ?? undefined,
+    bloodType: b.bloodType ?? undefined,
+    recordedAt: b.recordedAt,
+  };
+}
+
+export const biometricsInputSchema = z.object({
+  bloodPressure: z.string().max(20).optional(),
+  heartRate: z.string().max(20).optional(),
+  temperature: z.string().max(20).optional(),
+  weight: z.string().max(20).optional(),
+  height: z.string().max(20).optional(),
+  bmi: z.string().max(20).optional(),
+  bloodType: z.string().max(10).optional(),
+});
+
+/** Upsert the one vitals row for `patientId` — shared by both the doctor and patient-self-service routes below. */
+export async function upsertBiometrics(patientId: string, input: z.infer<typeof biometricsInputSchema>): Promise<BiometricsRow> {
+  const values = {
+    patientId,
+    bloodPressure: input.bloodPressure ?? null,
+    heartRate: input.heartRate ?? null,
+    temperature: input.temperature ?? null,
+    weight: input.weight ?? null,
+    height: input.height ?? null,
+    bmi: input.bmi ?? null,
+    bloodType: input.bloodType ?? null,
+    recordedAt: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+  };
+  const [row] = await getDb()
+    .insert(biometrics)
+    .values(values)
+    .onConflictDoUpdate({ target: biometrics.patientId, set: { ...values, updatedAt: new Date() } })
+    .returning();
+  return row!;
+}
+
+/** GET /practice/patients/:patientId/biometrics — a roster patient's current vitals, or null if none recorded. */
+router.get(
+  '/patients/:patientId/biometrics',
+  asyncHandler(async (req, res) => {
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const [row] = await getDb().select().from(biometrics).where(eq(biometrics.patientId, patientId));
+    res.json(toBiometrics(row));
+  }),
+);
+
+/** PUT /practice/patients/:patientId/biometrics — record/update a roster patient's vitals. */
+router.put(
+  '/patients/:patientId/biometrics',
+  asyncHandler(async (req, res) => {
+    const input = biometricsInputSchema.parse(req.body);
+    const patientId = await resolvePatientId(param(req, 'patientId'));
+    const row = await upsertBiometrics(patientId, input);
+    res.status(201).json(toBiometrics(row));
   }),
 );
 
@@ -543,6 +617,9 @@ router.post(
     const db = getDb();
     const docId = await doctorIdFor(req.user!.id);
     const [doc] = docId ? await db.select().from(doctors).where(eq(doctors.id, docId)) : [];
+    if (doc && !capabilitiesFor(doc.providerType).canPrescribe) {
+      throw new HttpError(403, `${doc.providerType}s aren't able to write prescriptions.`);
+    }
     const doctorName = doc?.name ?? `${req.user!.email}`;
     const datePrescribed = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const patientId = await resolvePatientId(param(req, 'patientId'));
@@ -661,6 +738,12 @@ router.post(
   auditAccess('lab'),
   asyncHandler(async (req, res) => {
     const input = labInputSchema.parse(req.body);
+    const db = getDb();
+    const docId = await doctorIdFor(req.user!.id);
+    const [doc] = docId ? await db.select().from(doctors).where(eq(doctors.id, docId)) : [];
+    if (doc && !capabilitiesFor(doc.providerType).canOrderLabs) {
+      throw new HttpError(403, `${doc.providerType}s aren't able to order labs.`);
+    }
     const patientId = await resolvePatientId(param(req, 'patientId'));
     const row = await insertLab(patientId, input);
     res.status(201).json(toLab(row));

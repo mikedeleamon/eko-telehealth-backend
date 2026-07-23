@@ -5,6 +5,7 @@ import { getDb } from '../db/client';
 import { appointments, reviews, users } from '../db/schema';
 import { asyncHandler } from '../lib/http';
 import { requireAuth } from '../middleware/auth';
+import { isProviderAccountType } from '../lib/providerAccess';
 
 const router = Router();
 
@@ -121,7 +122,7 @@ router.post(
       .values({
         author: authorName,
         subject,
-        direction: req.user!.accountType === 'Doctor' ? 'provider→patient' : 'patient→provider',
+        direction: isProviderAccountType(req.user!.accountType) ? 'provider→patient' : 'patient→provider',
         rating,
         communicationRating,
         experienceRating,

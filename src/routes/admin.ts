@@ -2,11 +2,13 @@ import { Router } from 'express';
 import { count, desc, eq, gte, inArray, sum } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '../db/client';
-import { appointments, complaints, contentBlocks, currencies, doctors, payments, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
+import { appointments, complaints, contentBlocks, currencies, doctors, payments, pharmacies, platformSettings, promoCodes, promoRedemptions, providerApplications, reviews, users } from '../db/schema';
+import { env } from '../config/env';
 import { HttpError } from '../lib/errors';
 import { asyncHandler, param } from '../lib/http';
 import { formatJoined, formatNaira } from '../lib/format';
 import { requireAuth, requireAccountType } from '../middleware/auth';
+import { APPOINTMENT_PROVIDER_TYPES } from '../lib/providerCapabilities';
 import { notify } from '../services/notify';
 import { getPlatformSettings } from '../services/platformSettings';
 
@@ -270,6 +272,13 @@ router.patch(
   }),
 );
 
+// Mirrors routes/me.ts's documentUrl() — same R2-public-base-URL pattern for
+// resolving a stored key back to a fetchable link at read time.
+function documentUrl(storageKey: string): string {
+  const base = env.r2.publicBaseUrl;
+  return base ? `${base.replace(/\/$/, '')}/${storageKey}` : storageKey;
+}
+
 /** GET /admin/providers/applications — verification queue. */
 router.get(
   '/providers/applications',
@@ -277,16 +286,28 @@ router.get(
     const db = getDb();
     const rows = await db.select().from(providerApplications);
 
-    // Resolve the linked doctors row for approved Doctor applications, so
-    // this same list can show/toggle their in-home privilege (task 2.3) —
-    // one batched query, not one per row.
-    const userIds = rows.filter((a) => a.type === 'Doctor' && a.userId).map((a) => a.userId!);
+    // Resolve the linked doctors row for approved appointment-type
+    // applications (Doctor/Nurse/Therapist), so this same list can show/
+    // toggle their in-home privilege (task 2.3) — one batched query, not one
+    // per row.
+    const userIds = rows
+      .filter((a) => (APPOINTMENT_PROVIDER_TYPES as readonly string[]).includes(a.type) && a.userId)
+      .map((a) => a.userId!);
     const linkedDoctors = userIds.length ? await db.select().from(doctors).where(inArray(doctors.userId, userIds)) : [];
     const doctorByUserId = new Map(linkedDoctors.map((d) => [d.userId, d]));
+
+    // Same for approved Pharmacy applications — a pharmacies row, not a
+    // doctors row (Batch 3 Phase 3). Lab/Clinic still get neither.
+    const pharmacyUserIds = rows.filter((a) => a.type === 'Pharmacy' && a.userId).map((a) => a.userId!);
+    const linkedPharmacies = pharmacyUserIds.length
+      ? await db.select().from(pharmacies).where(inArray(pharmacies.userId, pharmacyUserIds))
+      : [];
+    const pharmacyByUserId = new Map(linkedPharmacies.map((p) => [p.userId, p]));
 
     res.json(
       rows.map((a) => {
         const linked = a.userId ? doctorByUserId.get(a.userId) : undefined;
+        const linkedPharmacy = a.userId ? pharmacyByUserId.get(a.userId) : undefined;
         return {
           id: a.id,
           name: a.name,
@@ -301,10 +322,44 @@ router.get(
           // can distinguish "not applicable" from "off".
           doctorId: linked?.id,
           canProvideInHome: linked?.canProvideInHome,
+          // Only present once approval has created a directory pharmacies
+          // row. `pharmacyActive` mirrors canProvideInHome's toggle pattern.
+          pharmacyId: linkedPharmacy?.id,
+          pharmacyActive: linkedPharmacy?.active,
           spokenLanguages: a.spokenLanguages,
+          documents: a.documents.map((d) => ({ ...d, url: documentUrl(d.key) })),
         };
       }),
     );
+  }),
+);
+
+/**
+ * PATCH /admin/providers/applications/:id/checks — set the 3 verification
+ * booleans (gov ID / email / phone). Partial patch, not a full replace — an
+ * admin ticking one box shouldn't require resending the other two.
+ */
+router.patch(
+  '/providers/applications/:id/checks',
+  asyncHandler(async (req, res) => {
+    const input = z
+      .object({ govId: z.boolean().optional(), email: z.boolean().optional(), phone: z.boolean().optional() })
+      .parse(req.body);
+    if (!Object.keys(input).length) throw new HttpError(400, 'Nothing to update.');
+
+    const patch: Partial<typeof providerApplications.$inferInsert> = {};
+    if (input.govId !== undefined) patch.checkGovId = input.govId;
+    if (input.email !== undefined) patch.checkEmail = input.email;
+    if (input.phone !== undefined) patch.checkPhone = input.phone;
+
+    const db = getDb();
+    const [row] = await db
+      .update(providerApplications)
+      .set(patch)
+      .where(eq(providerApplications.id, param(req, 'id')))
+      .returning();
+    if (!row) throw new HttpError(404, 'Application not found');
+    res.json({ checks: { govId: row.checkGovId, email: row.checkEmail, phone: row.checkPhone } });
   }),
 );
 
@@ -329,12 +384,105 @@ router.patch(
 );
 
 /**
+ * PATCH /admin/pharmacies/:id — toggle a directory pharmacy active/inactive
+ * (Batch 3 Phase 3). Mirrors PATCH /admin/doctors/:id's scope: the only
+ * admin-editable field post-approval, not a general pharmacy-editing
+ * endpoint — there's no self-service dashboard for a pharmacy to edit its
+ * own details this batch.
+ */
+router.patch(
+  '/pharmacies/:id',
+  asyncHandler(async (req, res) => {
+    const { active } = z.object({ active: z.boolean() }).parse(req.body);
+    const db = getDb();
+    const [row] = await db
+      .update(pharmacies)
+      .set({ active })
+      .where(eq(pharmacies.id, param(req, 'id')))
+      .returning();
+    if (!row) throw new HttpError(404, 'Pharmacy not found');
+    res.json({ id: row.id, active: row.active });
+  }),
+);
+
+/**
+ * Creates the entity a provider type needs once its application is
+ * approved. Doctor/Nurse/Therapist all land in the `doctors` table (via the
+ * providerType discriminator, Batch 3 Phase 2); Pharmacy lands in its own
+ * `pharmacies` table (Phase 3) instead.
+ *
+ * Returns undefined for a type with no handler yet (Lab/Clinic) — the
+ * applicant is still notified of the approval either way (see the route
+ * below); they just don't have a live profile until their type's handler
+ * lands. Previously every non-Doctor type silently no-op'd here AND skipped
+ * notifying the applicant — this function fixes the entity-creation gap; the
+ * route fixes the notification gap.
+ */
+async function createEntityForApproval(
+  row: typeof providerApplications.$inferSelect,
+): Promise<{ doctorId: string } | { pharmacyId: string } | undefined> {
+  if (!row.userId) return undefined;
+  const db = getDb();
+
+  if ((APPOINTMENT_PROVIDER_TYPES as readonly string[]).includes(row.type)) {
+    const providerType = row.type as (typeof APPOINTMENT_PROVIDER_TYPES)[number];
+    const [existing] = await db.select().from(doctors).where(eq(doctors.userId, row.userId));
+    if (existing) return { doctorId: existing.id };
+
+    const [created] = await db
+      .insert(doctors)
+      .values({
+        userId: row.userId,
+        name: row.name,
+        specialty: row.specialty,
+        category: row.category ?? row.specialty,
+        location: row.location,
+        fee: row.fee ?? '₦15,000',
+        available: true,
+        nextAvailable: '',
+        spokenLanguages: row.spokenLanguages,
+        providerType,
+        // Nurse's primary modality is Home Visit (locked decision) — grant the
+        // privilege on approval so they're immediately bookable for it; admin
+        // can still revoke via the existing toggle above, same as any Doctor.
+        canProvideInHome: providerType === 'Nurse',
+      })
+      .returning();
+    return { doctorId: created!.id };
+  }
+
+  if (row.type === 'Pharmacy') {
+    const [existing] = await db.select().from(pharmacies).where(eq(pharmacies.userId, row.userId));
+    if (existing) return { pharmacyId: existing.id };
+
+    const [user] = await db.select().from(users).where(eq(users.id, row.userId));
+    const [created] = await db
+      .insert(pharmacies)
+      .values({
+        userId: row.userId,
+        name: row.name,
+        // The application's `location` doubles as the pharmacy's directory
+        // address — same field, same meaning, no separate address input.
+        address: row.location,
+        fax: user?.phone ?? '',
+      })
+      .returning();
+    return { pharmacyId: created!.id };
+  }
+
+  return undefined;
+}
+
+/**
  * POST /admin/providers/applications/:id/decision
  *
  * Approving a Doctor application is what actually creates the bookable
  * `doctors` row and links it to the applicant's account — this is the only
  * path from "signed up as a Doctor" to "appears in search". Idempotent: a
  * second approval won't create a duplicate profile.
+ *
+ * Every decision notifies the applicant, regardless of provider type — see
+ * createEntityForApproval's doc comment for the bug this fixes.
  */
 router.post(
   '/providers/applications/:id/decision',
@@ -348,42 +496,34 @@ router.post(
       .returning();
     if (!row) throw new HttpError(404, 'Application not found');
 
-    let doctorId: string | undefined;
-    if (decision === 'approved' && row.type === 'Doctor' && row.userId) {
-      const [existing] = await db.select().from(doctors).where(eq(doctors.userId, row.userId));
-      if (existing) {
-        doctorId = existing.id;
-      } else {
-        const [created] = await db
-          .insert(doctors)
-          .values({
-            userId: row.userId,
-            name: row.name,
-            specialty: row.specialty,
-            category: row.category ?? row.specialty,
-            location: row.location,
-            fee: row.fee ?? '₦15,000',
-            available: true,
-            nextAvailable: '',
-            spokenLanguages: row.spokenLanguages,
-          })
-          .returning();
-        doctorId = created!.id;
+    if (decision === 'rejected') {
+      if (row.userId) {
+        await notify(
+          row.userId,
+          'Application Not Approved',
+          'Your provider application was not approved. Contact support if you think this is a mistake.',
+        );
       }
-      await notify(
-        row.userId,
-        'Application Approved',
-        'Your provider application was approved — your profile is now live and patients can book you.',
-      );
-    } else if (decision === 'rejected' && row.userId) {
-      await notify(
-        row.userId,
-        'Application Not Approved',
-        'Your provider application was not approved. Contact support if you think this is a mistake.',
-      );
+      res.json({ ok: true });
+      return;
     }
 
-    res.json({ ok: true, doctorId });
+    const entity = await createEntityForApproval(row);
+    if (row.userId) {
+      const message =
+        entity && 'doctorId' in entity
+          ? 'Your provider application was approved — your profile is now live and patients can book you.'
+          : entity && 'pharmacyId' in entity
+            ? "Your pharmacy application was approved — you're now listed in our provider directory."
+            : "Your provider application was approved. We'll be in touch with next steps to finish setting up your profile.";
+      await notify(row.userId, 'Application Approved', message);
+    }
+
+    res.json({
+      ok: true,
+      doctorId: entity && 'doctorId' in entity ? entity.doctorId : undefined,
+      pharmacyId: entity && 'pharmacyId' in entity ? entity.pharmacyId : undefined,
+    });
   }),
 );
 
@@ -478,7 +618,7 @@ router.get(
     const rows = await db
       .select()
       .from(users)
-      .where(inArray(users.accountType, ['Patient', 'Doctor']))
+      .where(inArray(users.accountType, ['Patient', 'Doctor', 'Provider']))
       .orderBy(desc(users.joinedAt));
     res.json(
       rows.map((u) => ({
@@ -488,8 +628,50 @@ router.get(
         accountType: u.accountType,
         joined: formatJoined(u.joinedAt),
         status: u.status,
+        govId: {
+          status: u.govIdStatus,
+          fileName: u.govIdFileName ?? undefined,
+          url: u.govIdKey ? documentUrl(u.govIdKey) : undefined,
+        },
       })),
     );
+  }),
+);
+
+/**
+ * PATCH /admin/users/:id — suspend or reactivate a patient or provider
+ * account. Narrow by design, mirrors PATCH /admin/doctors/:id's scope — the
+ * only admin-editable field on a user account. Enforcement already exists
+ * at every session-issuing route (login, 2FA verify, password reset all
+ * check `status === 'suspended'`, routes/auth.ts) — this is what actually
+ * lets an admin flip it, closing the gap where the status was only ever
+ * displayed, never actionable.
+ */
+router.patch(
+  '/users/:id',
+  asyncHandler(async (req, res) => {
+    const { status } = z.object({ status: z.enum(['active', 'suspended']) }).parse(req.body);
+    const db = getDb();
+    const [row] = await db.update(users).set({ status }).where(eq(users.id, param(req, 'id'))).returning();
+    if (!row) throw new HttpError(404, 'User not found');
+    res.json({ id: row.id, status: row.status });
+  }),
+);
+
+/**
+ * PATCH /admin/users/:id/gov-id — approve or reject a submitted gov-ID
+ * document. Only meaningful once status is 'pending' (a submission exists),
+ * but doesn't hard-require it — an admin correcting a mistaken decision on
+ * an already-verified/rejected account is a legitimate, if rare, case.
+ */
+router.patch(
+  '/users/:id/gov-id',
+  asyncHandler(async (req, res) => {
+    const { status } = z.object({ status: z.enum(['verified', 'rejected']) }).parse(req.body);
+    const db = getDb();
+    const [row] = await db.update(users).set({ govIdStatus: status }).where(eq(users.id, param(req, 'id'))).returning();
+    if (!row) throw new HttpError(404, 'User not found');
+    res.json({ id: row.id, govIdStatus: row.govIdStatus });
   }),
 );
 
